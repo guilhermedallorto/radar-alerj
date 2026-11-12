@@ -142,6 +142,44 @@ def find_part_ii_link(html: str, base_url: str) -> str:
     )
 
 
+def find_edition_continuation(response: requests.Response) -> str | None:
+    """Encontra o passo intermediário da IOERJ sem depender da codificação do texto.
+
+    Em algumas respostas, o portal declara/é interpretado como ISO-8859-1 embora
+    entregue texto UTF-8. Nesse caso, "última edição" chega como "Ãºltima edição"
+    e uma detecção baseada apenas no texto falha. O caminho do link e o parâmetro
+    `data` são ASCII e continuam identificáveis.
+    """
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "")).strip()
+        if not href or href.lower().startswith(("javascript:", "#")):
+            continue
+        label = norm(anchor.get_text(" ", strip=True))
+        parsed = urlparse(href)
+        path = parsed.path.lower()
+        query = parse_qs(parsed.query)
+
+        # Forma observada no portal: do_seleciona_edicao.php?data=...&PHPSESSID=...
+        if path.endswith("do_seleciona_edicao.php"):
+            return urljoin(response.url, href)
+
+        # Compatibilidade caso o portal altere o nome do endpoint, mas mantenha
+        # o link textual e o parâmetro que codifica a data da edição.
+        if "clique aqui" in label and "data" in query:
+            return urljoin(response.url, href)
+
+    # Fallback para redirecionamentos implementados por meta refresh.
+    meta = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+    if meta and meta.get("content"):
+        match = re.search(r"url\s*=\s*['\"]?([^'\";]+)", str(meta["content"]), re.I)
+        if match:
+            return urljoin(response.url, match.group(1).strip())
+
+    return None
+
+
 def discover_latest() -> dict[str, Any]:
     home = http_get(PORTAL)
     home_soup = BeautifulSoup(home.text, "html.parser")
@@ -153,18 +191,19 @@ def discover_latest() -> dict[str, Any]:
     last_url = last_url or LAST_EDITION
 
     latest = http_get(last_url)
-    # A IOERJ pode apresentar uma página de redirecionamento com link "clique aqui".
-    latest_soup = BeautifulSoup(latest.text, "html.parser")
-    if "redirecionando para a ultima edicao" in norm(latest_soup.get_text(" ", strip=True)):
-        continuation = None
-        for a in latest_soup.find_all("a", href=True):
-            if "clique aqui" in norm(a.get_text(" ", strip=True)):
-                continuation = urljoin(latest.url, a["href"])
-                break
-        if continuation:
-            latest = http_get(continuation)
-            latest_soup = BeautifulSoup(latest.text, "html.parser")
+    # A IOERJ entrega primeiro uma página intermediária. Siga o link que aponta
+    # para a seleção da edição mesmo quando a acentuação do HTML estiver incorreta.
+    visited = {latest.url}
+    for _ in range(3):
+        continuation = find_edition_continuation(latest)
+        if not continuation or continuation in visited:
+            break
+        visited.add(continuation)
+        latest = http_get(continuation)  # mesma requests.Session: preserva cookies
+    else:
+        raise RuntimeError("O portal da IOERJ apresentou redirecionamentos intermediários em excesso.")
 
+    latest_soup = BeautifulSoup(latest.text, "html.parser")
     selection_url = latest.url
     part_url = find_part_ii_link(latest.text, selection_url)
     edition_date = extract_date(latest_soup, selection_url)
