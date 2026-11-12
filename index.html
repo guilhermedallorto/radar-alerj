@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#172b3a" />
+  <title>Radar do Diário Oficial · ALERJ</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Libre+Baskerville:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <section id="login-screen" class="login-screen">
+    <div class="login-card">
+      <div class="seal">ALERJ</div>
+      <div class="eyebrow">GABINETE PARLAMENTAR · ACESSO RESTRITO</div>
+      <h1>Radar do<br><span>Diário Oficial</span></h1>
+      <p class="muted">Parte II · Poder Legislativo</p>
+      <form id="login-form" class="login-form">
+        <label for="email">E-mail</label>
+        <input id="email" type="email" autocomplete="username" required placeholder="seu e-mail" />
+        <label for="password">Senha</label>
+        <input id="password" type="password" autocomplete="current-password" required placeholder="sua senha" />
+        <button class="btn btn-primary full" type="submit">Entrar no Radar</button>
+      </form>
+      <p id="login-error" class="error hidden"></p>
+      <p class="login-foot">Acesso disponível somente a usuários autorizados.</p>
+    </div>
+  </section>
+
+  <div id="app" class="hidden">
+    <div class="topline"><span>ASSEMBLEIA LEGISLATIVA DO ESTADO DO RIO DE JANEIRO</span><span>PARTE II · PODER LEGISLATIVO</span></div>
+    <header class="masthead wrap">
+      <div class="brand-lockup"><div class="brand-mark">ALERJ</div><div><div class="eyebrow">LEITURA DIÁRIA PARA O GABINETE</div><h1>RADAR <span>DO DIÁRIO OFICIAL</span></h1></div></div>
+      <div class="header-actions"><span id="header-date" class="muted small"></span><button id="logout-btn" class="btn btn-outline">Sair</button></div>
+    </header>
+
+    <nav class="nav wrap" aria-label="Navegação principal">
+      <button class="nav-tab active" data-view="daily">Leitura diária</button>
+      <button class="nav-tab" data-view="publications">Publicações</button>
+      <button class="nav-tab" data-view="themes">Temas monitorados</button>
+      <button class="nav-tab" data-view="research">Pesquisar no acervo</button>
+      <button class="nav-tab" data-view="history">Edições</button>
+    </nav>
+
+    <main class="wrap main-content">
+      <section class="search-strip">
+        <div class="search-box"><span class="search-icon">⌕</span><input id="global-search" type="search" placeholder="Buscar projeto, autor, órgão, município ou palavra..." /><button id="global-search-btn" class="btn btn-dark">Buscar</button></div>
+        <span id="last-read" class="muted tiny">Aguardando a primeira coleta</span>
+      </section>
+
+      <div class="topic-row" id="topic-row"><span class="topic-label">MONITORAMENTO</span><span class="muted tiny">Cadastre temas para personalizar o Radar.</span></div>
+
+      <section id="view-daily" class="view">
+        <div class="section-kicker">ACOMPANHAMENTO DAS EDIÇÕES</div>
+        <div class="edition-tabs" id="edition-tabs"><div class="skeleton">Carregando edições...</div></div>
+        <div class="daily-heading">
+          <div><div class="eyebrow" id="edition-weekday">EDIÇÃO SELECIONADA</div><h2 id="edition-title">Leitura diária</h2><p id="edition-subtitle" class="muted"></p></div>
+          <a id="edition-source" class="btn btn-outline" href="#" target="_blank" rel="noopener">Abrir Diário Oficial ↗</a>
+        </div>
+        <div class="summary-panel">
+          <div class="summary-label">SÍNTESE DA EDIÇÃO</div>
+          <p id="daily-summary">Ainda não há edição processada. A síntese será exibida após a primeira coleta automática.</p>
+        </div>
+        <div class="stat-grid" id="edition-stats"></div>
+        <div class="section-title-row"><div><div class="section-kicker">LEITURA ORIENTADA</div><h2>Destaques para o gabinete</h2></div><span id="highlight-count" class="count-note"></span></div>
+        <div id="highlights" class="highlight-grid"><div class="empty-state">Nenhuma edição processada ainda.</div></div>
+        <div class="section-title-row other-title"><div><div class="section-kicker">ACERVO COMPLETO</div><h2>Demais publicações</h2></div><button class="text-button" data-go="publications">Ver todas as publicações →</button></div>
+        <div id="other-publications" class="other-groups"></div>
+      </section>
+
+      <section id="view-publications" class="view hidden">
+        <div class="page-heading"><div><div class="section-kicker">ACERVO INTEGRAL · TODAS AS PUBLICAÇÕES</div><h2>Publicações</h2><p class="muted">O acervo inclui todos os atos identificados na Parte II, e não apenas os classificados como relevantes.</p></div></div>
+        <div class="filter-bar"><input id="publication-query" type="search" placeholder="Pesquisar no texto dos atos..." /><select id="publication-filter"><option value="all">Todas as publicações</option><option value="relevant">Relevantes para os temas</option><option value="other">Demais publicações</option></select><select id="publication-date"><option value="all">Todas as edições</option></select><button id="publication-search-btn" class="btn btn-dark">Filtrar</button></div>
+        <div id="publication-results" class="publication-list"></div><div class="load-more-wrap"><button id="pub-load-more" class="btn btn-outline hidden">Carregar mais publicações</button></div>
+      </section>
+
+      <section id="view-themes" class="view hidden">
+        <div class="page-heading"><div><div class="section-kicker">PERSONALIZAÇÃO DO MONITORAMENTO</div><h2>Temas monitorados</h2><p class="muted">A IA considera contexto e critérios substantivos. Palavras-chave funcionam como pistas, não como único critério.</p></div></div>
+        <div class="theme-editor">
+          <form id="theme-form">
+            <input id="theme-id" type="hidden" />
+            <div class="form-grid"><div class="field span-2"><label for="theme-name">Nome do tema</label><input id="theme-name" required placeholder="Ex.: Magé" /></div><div class="field"><label for="theme-priority">Prioridade</label><select id="theme-priority"><option value="1">1 · Alta</option><option value="2">2</option><option value="3" selected>3 · Média</option><option value="4">4</option><option value="5">5 · Baixa</option></select></div><div class="field span-3"><label for="theme-description">Descrição e escopo</label><textarea id="theme-description" rows="2" placeholder="O que deve ser considerado relacionado a este tema?"></textarea></div><div class="field span-3"><label for="theme-keywords">Palavras-chave (separadas por vírgula)</label><input id="theme-keywords" placeholder="Magé, Piabetá, Vila Inhomirim..." /></div><div class="field span-3"><label for="theme-include">Critérios de inclusão</label><textarea id="theme-include" rows="2" placeholder="Quais tipos de publicação devem ser incluídos?"></textarea></div><div class="field span-3"><label for="theme-exclude">Critérios de exclusão</label><textarea id="theme-exclude" rows="2" placeholder="O que não deve ser classificado neste tema?"></textarea></div></div>
+            <div class="form-actions"><label class="check-label"><input type="checkbox" id="theme-active" checked /> Tema ativo</label><div><button type="button" id="theme-cancel" class="btn btn-outline hidden">Cancelar edição</button><button type="submit" class="btn btn-primary">Salvar tema</button></div></div>
+          </form>
+        </div>
+        <div id="theme-list" class="theme-list"></div>
+      </section>
+
+      <section id="view-research" class="view hidden">
+        <div class="page-heading"><div><div class="section-kicker">PESQUISA DOCUMENTAL COM IA</div><h2>Pergunte ao acervo</h2><p class="muted">A resposta será construída com base nas publicações indexadas e virá acompanhada das fontes e páginas correspondentes.</p></div></div>
+        <form id="research-form" class="research-form"><textarea id="research-question" rows="3" placeholder="Ex.: O que foi publicado sobre Magé e Guapimirim nas últimas quatro edições?" required></textarea><div class="research-actions"><span class="muted tiny">A IA não consulta fontes externas: utiliza o conteúdo já coletado pelo Radar.</span><button id="research-submit" class="btn btn-primary">Pesquisar no acervo</button></div></form>
+        <div id="research-answer" class="research-answer hidden"></div>
+      </section>
+
+      <section id="view-history" class="view hidden">
+        <div class="page-heading"><div><div class="section-kicker">HISTÓRICO DE COLETA</div><h2>Edições do Diário Oficial</h2><p class="muted">Acesso ao histórico processado e aos links oficiais de cada edição. Os PDFs permanecem hospedados na IOERJ.</p></div></div>
+        <div id="edition-history" class="history-list"></div>
+        <div class="run-status" id="run-status"></div>
+      </section>
+    </main>
+    <footer class="footer"><div class="wrap footer-inner"><span>RADAR DO DIÁRIO OFICIAL · PARTE II — PODER LEGISLATIVO</span><span>Fonte: Imprensa Oficial do Estado do Rio de Janeiro · Consulte sempre o documento original.</span></div></footer>
+  </div>
+
+  <div id="publication-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div class="modal-backdrop" data-close-modal></div><article class="modal-card"><button class="modal-close" data-close-modal aria-label="Fechar">×</button><div id="modal-content"></div></article></div>
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

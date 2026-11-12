@@ -1,0 +1,2 @@
+[functions.ask-radar]
+verify_jwt = true
