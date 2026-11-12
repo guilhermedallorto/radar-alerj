@@ -13,6 +13,7 @@ import sys
 import time
 import unicodedata
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
@@ -26,9 +27,10 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 PORTAL = "https://portal.ioerj.com.br/"
-LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima_edicao.php"
+LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima_edicao.php"  # fallback
+SELECT_DATE = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_seleciona_data.php"
 TZ = "America/Sao_Paulo"
-MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
 CHUNK_LIMIT = 14500
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -180,33 +182,93 @@ def find_edition_continuation(response: requests.Response) -> str | None:
     return None
 
 
+def date_from_calendar_link(href: str) -> date | None:
+    """Decodifica a data Base64 usada nos links do calendário da IOERJ."""
+    parsed = urlparse(href)
+    values = parse_qs(parsed.query).get("data", [])
+    for value in values:
+        try:
+            token = unquote(value).strip()
+            token += "=" * (-len(token) % 4)
+            decoded = base64.b64decode(token, validate=False).decode("ascii", "ignore").strip()
+            match = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", decoded)
+            if match:
+                return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except Exception:
+            continue
+    return None
+
+
+def discover_latest_from_calendar() -> tuple[date, str]:
+    """Entra pelo calendário de datas e seleciona a edição mais recente disponível."""
+    calendar = http_get(SELECT_DATE)
+    soup = BeautifulSoup(calendar.text, "html.parser")
+    today_local = datetime.now(ZoneInfo(TZ)).date()
+    candidates: list[tuple[date, str]] = []
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href", "")).strip()
+        if not href:
+            continue
+        target = urljoin(calendar.url, href)
+        path = urlparse(target).path.lower()
+        if not path.endswith("do_seleciona_edicao.php"):
+            continue
+        edition_day = date_from_calendar_link(target)
+        if edition_day:
+            candidates.append((edition_day, target))
+
+    # O calendário pode listar vários anos. Escolhemos a maior data que não
+    # ultrapasse a data local de hoje, para não selecionar um dia futuro.
+    eligible = [(day, url) for day, url in candidates if day <= today_local]
+    if not eligible:
+        raise RuntimeError(
+            "A página de seleção de datas da IOERJ foi aberta, mas nenhum dia com edição foi identificado. "
+            f"URL: {calendar.url}; links de edição encontrados: {len(candidates)}."
+        )
+    return max(eligible, key=lambda item: item[0])
+
+
 def discover_latest() -> dict[str, Any]:
-    home = http_get(PORTAL)
-    home_soup = BeautifulSoup(home.text, "html.parser")
-    last_url = None
-    for a in home_soup.find_all("a", href=True):
-        if "ultima edicao" in norm(a.get_text(" ", strip=True)):
-            last_url = urljoin(home.url, a["href"])
-            break
-    last_url = last_url or LAST_EDITION
+    # Caminho principal: o calendário de datas. Evita a página de redirecionamento
+    # do_ultima_edicao.php, cujo HTML já causou problemas de codificação/sessão.
+    try:
+        calendar_date, selection_url = discover_latest_from_calendar()
+        latest = http_get(selection_url)  # mesma requests.Session para cookies
+        latest_soup = BeautifulSoup(latest.text, "html.parser")
+        part_url = find_part_ii_link(latest.text, latest.url)
+        edition_date = extract_date(latest_soup, latest.url)
+        if edition_date != calendar_date:
+            print(
+                "Aviso: a data do link do calendário difere da data apresentada na página da edição; "
+                f"calendário={calendar_date.isoformat()}, página={edition_date.isoformat()}."
+            )
+    except Exception as calendar_exc:
+        # Fallback de compatibilidade: mantém o caminho anterior caso o calendário
+        # da IOERJ altere sua marcação ou deixe de expor os links de data.
+        print(f"Falha ao localizar a edição pelo calendário ({calendar_exc}); tentando o caminho anterior.")
+        home = http_get(PORTAL)
+        home_soup = BeautifulSoup(home.text, "html.parser")
+        last_url = None
+        for a in home_soup.find_all("a", href=True):
+            if "ultima edicao" in norm(a.get_text(" ", strip=True)):
+                last_url = urljoin(home.url, a["href"])
+                break
+        latest = http_get(last_url or LAST_EDITION)
+        visited = {latest.url}
+        for _ in range(3):
+            continuation = find_edition_continuation(latest)
+            if not continuation or continuation in visited:
+                break
+            visited.add(continuation)
+            latest = http_get(continuation)
+        else:
+            raise RuntimeError("O portal da IOERJ apresentou redirecionamentos intermediários em excesso.")
+        latest_soup = BeautifulSoup(latest.text, "html.parser")
+        selection_url = latest.url
+        part_url = find_part_ii_link(latest.text, selection_url)
+        edition_date = extract_date(latest_soup, selection_url)
 
-    latest = http_get(last_url)
-    # A IOERJ entrega primeiro uma página intermediária. Siga o link que aponta
-    # para a seleção da edição mesmo quando a acentuação do HTML estiver incorreta.
-    visited = {latest.url}
-    for _ in range(3):
-        continuation = find_edition_continuation(latest)
-        if not continuation or continuation in visited:
-            break
-        visited.add(continuation)
-        latest = http_get(continuation)  # mesma requests.Session: preserva cookies
-    else:
-        raise RuntimeError("O portal da IOERJ apresentou redirecionamentos intermediários em excesso.")
-
-    latest_soup = BeautifulSoup(latest.text, "html.parser")
-    selection_url = latest.url
-    part_url = find_part_ii_link(latest.text, selection_url)
-    edition_date = extract_date(latest_soup, selection_url)
     label_match = re.search(r"Ano\s+([IVXLCDM]+).*?N[º°o]\s*(\d+)", latest_soup.get_text(" ", strip=True), re.I)
     edition_label = f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}" if label_match else ""
     return {
@@ -358,7 +420,7 @@ def log_run(status: str, message: str, edition_date: str | None = None, total: i
 
 
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
-    """Solicita JSON ao Gemini, com novas tentativas para limites temporários."""
+    """Solicita JSON ao Gemini com backoff para 429/503 e falhas de rede/timeout."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -368,27 +430,48 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
         },
     }
     response = None
-    for attempt in range(5):
-        response = requests.post(
-            endpoint,
-            headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
-            json=payload,
-            timeout=(30, 180),
-        )
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                endpoint,
+                headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
+                json=payload,
+                timeout=(25, 120),
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    f"Gemini não respondeu após {max_attempts} tentativas; última falha de rede/timeout: {exc}"
+                ) from exc
+            wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
+            print(
+                f"Gemini sem resposta ({type(exc).__name__}); tentativa {attempt}/{max_attempts}. "
+                f"Nova tentativa em {wait_seconds}s."
+            )
+            time.sleep(wait_seconds)
+            continue
+
         if response.ok:
             break
-        if response.status_code not in (429, 500, 502, 503, 504) or attempt == 4:
+        if response.status_code not in (429, 500, 502, 503, 504) or attempt >= max_attempts:
             raise RuntimeError(
-                f"Gemini API retornou HTTP {response.status_code}: {response.text[:1500]}"
+                f"Gemini API retornou HTTP {response.status_code} após {attempt} tentativa(s): {response.text[:1500]}"
             )
+
         retry_after = response.headers.get("Retry-After", "")
         try:
             wait_seconds = float(retry_after)
         except (TypeError, ValueError):
-            wait_seconds = min(60, 5 * (2 ** attempt))
-        wait_seconds = max(2, min(wait_seconds, 90))
-        print(f"Gemini temporariamente indisponível (HTTP {response.status_code}); nova tentativa em {wait_seconds:.0f}s.")
+            wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
+        wait_seconds = max(3, min(wait_seconds, 120))
+        print(
+            f"Gemini temporariamente indisponível (HTTP {response.status_code}); "
+            f"tentativa {attempt}/{max_attempts}, nova tentativa em {wait_seconds:.0f}s."
+        )
         time.sleep(wait_seconds)
+    else:
+        raise RuntimeError("Gemini não respondeu após todas as tentativas configuradas.")
 
     data = response.json()
     candidates = data.get("candidates") or []
