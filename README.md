@@ -54,7 +54,7 @@ No painel do Supabase, abra **Project Settings → API Keys** (ou use o botão *
 - **Publishable key** (ou a chave pública `anon`, se a interface ainda a apresentar);
 - **Secret key** (`sb_secret_...`), para uso exclusivo no GitHub Actions. Ela concede acesso administrativo e nunca pode ser colocada no navegador. O worker também aceita a chave legada `service_role` como alternativa de compatibilidade.
 
-**Nunca coloque a secret key ou a chave da OpenAI no HTML, em `config.js`, em um repositório público ou em mensagens.** A publishable key (`sb_publishable_...`) pode estar no frontend porque o banco está protegido por RLS. A Supabase recomenda o par publishable/secret e está descontinuando as chaves legadas `anon` e `service_role` ao final de 2026. ([documentação oficial](https://supabase.com/docs/guides/getting-started/api-keys))
+**Nunca coloque a secret key ou a chave da API Gemini no HTML, em `config.js`, em um repositório público ou em mensagens.** A publishable key (`sb_publishable_...`) pode estar no frontend porque o banco está protegido por RLS. A Supabase recomenda o par publishable/secret e está descontinuando as chaves legadas `anon` e `service_role` ao final de 2026. ([documentação oficial](https://supabase.com/docs/guides/getting-started/api-keys))
 
 ---
 
@@ -77,7 +77,7 @@ window.RADAR_CONFIG = {
 ## 6. Criar o repositório e publicar no GitHub Pages
 
 1. Crie um repositório GitHub para o projeto.
-2. Envie os arquivos e pastas deste pacote, incluindo o `config.js` que você acabou de criar. Ele contém somente a chave publicável; não envie `SUPABASE_SERVICE_ROLE_KEY` nem `OPENAI_API_KEY` em nenhum arquivo.
+2. Envie os arquivos e pastas deste pacote, incluindo o `config.js` que você acabou de criar. Ele contém somente a chave publicável; não envie `SUPABASE_SERVICE_ROLE_KEY` nem `GEMINI_API_KEY` em nenhum arquivo.
 3. No GitHub, abra **Settings → Pages**.
 4. Em **Build and deployment**, escolha **Deploy from a branch**.
 5. Selecione a branch `main` e a pasta `/ (root)`; salve.
@@ -106,9 +106,9 @@ No repositório GitHub:
 2. Em **Secrets**, escolha **New repository secret** e crie:
    - `SUPABASE_URL` — URL do projeto Supabase;
    - `SUPABASE_SECRET_KEY` — secret key administrativa do Supabase (`sb_secret_...`);
-   - `OPENAI_API_KEY` — chave da API da OpenAI.
+   - `GEMINI_API_KEY` — chave da API Gemini.
 3. Em **Variables**, crie opcionalmente:
-   - `OPENAI_MODEL` — modelo disponível na sua conta (o padrão do projeto é `gpt-4.1-mini`).
+   - `GEMINI_MODEL` — modelo Gemini disponível na sua conta (o padrão do projeto é `gemini-3.8-flash`).
 
 As três primeiras são secrets, não variables. Não as coloque em arquivos do repositório. A variável do workflow já está configurada para ler `SUPABASE_SECRET_KEY`.
 
@@ -124,19 +124,26 @@ As três primeiras são secrets, não variables. Não as coloque em arquivos do 
 
 A rotina está programada para todos os dias às **9h15 no fuso `America/Sao_Paulo`**. O GitHub informa que execuções agendadas podem sofrer atrasos em períodos de alta demanda; portanto, não é uma garantia de execução no minuto exato. O workflow também pode ser iniciado manualmente. Em repositórios públicos sem atividade por 60 dias, o GitHub pode desativar workflows agendados; confira periodicamente a aba Actions.
 
+
+### Migração para Gemini
+
+A versão atual utiliza `gemini-3.8-flash` na coleta e na pesquisa assistida. A troca do provedor de IA **não exige alterações no schema do banco** nem uma nova execução de `supabase/schema.sql`. Ela exige `GEMINI_API_KEY` e `GEMINI_MODEL` no GitHub Actions e também nos segredos das Edge Functions do Supabase, pois são dois ambientes de execução independentes.
+
+O plano gratuito do Gemini tem limites de requisições e tokens, que variam por modelo e projeto. A documentação do Google informa que, na modalidade gratuita, o conteúdo enviado pode ser utilizado para melhorar os produtos. Como o Radar envia textos de publicações oficiais e também os critérios dos temas monitorados, avalie se esses critérios podem revelar informação interna antes de utilizá-lo. Consulte os limites e termos atuais no [preçário oficial](https://ai.google.dev/gemini-api/docs/pricing) e nos [limites de taxa](https://ai.google.dev/gemini-api/docs/rate-limits).
+
 ## 10. Instalar a função de pesquisa com IA
 
-A aba “Pesquisar no acervo” usa uma Edge Function do Supabase para recuperar documentos e formular uma resposta com referências. Essa função não expõe a chave da OpenAI ao navegador.
+A aba “Pesquisar no acervo” usa uma Edge Function do Supabase para recuperar documentos e formular uma resposta com referências. Essa função não expõe a chave da API Gemini ao navegador.
 
 Pré-requisitos: instalar o [Supabase CLI](https://supabase.com/docs/guides/cli) e autenticar-se na conta.
 
-No terminal, na pasta raiz do projeto:
+No terminal, na pasta raiz do projeto (a função está em `supabase/functions/ask-radar/index.ts`):
 
 ```bash
 supabase login
 supabase link --project-ref SEU_PROJECT_REF
-supabase secrets set OPENAI_API_KEY=SUA_CHAVE_OPENAI
-supabase secrets set OPENAI_MODEL=gpt-4.1-mini
+supabase secrets set GEMINI_API_KEY=SUA_CHAVE_GEMINI
+supabase secrets set GEMINI_MODEL=gemini-3.8-flash
 supabase functions deploy ask-radar
 ```
 
@@ -202,4 +209,4 @@ O arquivo é baixado em memória durante o workflow. Se a extração falhar ou a
 
 ## Custos e serviços
 
-Supabase, GitHub Actions e API da OpenAI têm planos, franquias e/ou custos que dependem do volume e das condições da conta. A coleta diária consome a API da OpenAI ao segmentar/classificar os atos e gerar resumos. A pesquisa assistida por IA também consome API. Verifique os planos e limites vigentes antes de colocar em uso contínuo.
+Supabase, GitHub Actions e API Gemini têm planos, franquias e/ou custos que dependem do volume e das condições da conta. A coleta diária consome a API Gemini ao segmentar/classificar os atos e gerar resumos. A pesquisa assistida por IA também consome API. Verifique os planos e limites vigentes antes de colocar em uso contínuo.

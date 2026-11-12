@@ -25,14 +25,16 @@ from PIL import Image
 PORTAL = "https://portal.ioerj.com.br/"
 LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima_edicao.php"
 TZ = "America/Sao_Paulo"
-MODEL = os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 CHUNK_LIMIT = 14500
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_KEY:
     raise RuntimeError("Defina o secret SUPABASE_SECRET_KEY (preferencial) ou SUPABASE_SERVICE_ROLE_KEY (legado).")
-OPENAI_KEY = os.environ["OPENAI_API_KEY"]
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_KEY:
+    raise RuntimeError("Defina o secret GEMINI_API_KEY no GitHub Actions.")
 
 session = requests.Session()
 session.headers.update({
@@ -275,32 +277,61 @@ def log_run(status: str, message: str, edition_date: str | None = None, total: i
         db_post("ingestion_runs", {"status": status, "edition_date": edition_date, "message": message, "finished_at": finished, "publications_found": total, "publications_relevant": relevant})
 
 
-def openai_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": MODEL,
-            "input": prompt,
-            "max_output_tokens": max_output_tokens,
-            "text": {"format": {"type": "json_object"}},
-        }, timeout=180,
-    )
-    if not response.ok:
-        raise RuntimeError(f"API de IA retornou HTTP {response.status_code}: {response.text[:1500]}")
+def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
+    """Solicita JSON ao Gemini, com novas tentativas para limites temporários."""
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": max_output_tokens,
+        },
+    }
+    response = None
+    for attempt in range(5):
+        response = requests.post(
+            endpoint,
+            headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=(30, 180),
+        )
+        if response.ok:
+            break
+        if response.status_code not in (429, 500, 502, 503, 504) or attempt == 4:
+            raise RuntimeError(
+                f"Gemini API retornou HTTP {response.status_code}: {response.text[:1500]}"
+            )
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            wait_seconds = float(retry_after)
+        except (TypeError, ValueError):
+            wait_seconds = min(60, 5 * (2 ** attempt))
+        wait_seconds = max(2, min(wait_seconds, 90))
+        print(f"Gemini temporariamente indisponível (HTTP {response.status_code}); nova tentativa em {wait_seconds:.0f}s.")
+        time.sleep(wait_seconds)
+
     data = response.json()
-    output = data.get("output_text")
+    candidates = data.get("candidates") or []
+    parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+    output = "\n".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("thought")
+    ).strip()
     if not output:
-        output = "\n".join(
-            part.get("text", "")
-            for item in data.get("output", [])
-            for part in item.get("content", [])
-            if part.get("type") == "output_text"
+        feedback = data.get("promptFeedback", {}).get("blockReason")
+        finish_reason = candidates[0].get("finishReason") if candidates else None
+        raise RuntimeError(
+            "Gemini não devolveu texto utilizável. "
+            f"Motivo de bloqueio: {feedback or 'não informado'}; conclusão: {finish_reason or 'sem candidato'}."
         )
     try:
-        return json.loads(output)
+        parsed = json.loads(output)
+        if not isinstance(parsed, dict):
+            raise ValueError("A resposta JSON não é um objeto.")
+        return parsed
     except Exception as exc:
-        raise RuntimeError(f"A IA não devolveu JSON válido: {str(output)[:800]}") from exc
+        raise RuntimeError(f"O Gemini não devolveu JSON válido: {output[:800]}") from exc
 
 
 def load_themes() -> list[dict[str, Any]]:
@@ -331,7 +362,7 @@ RETORNE SOMENTE JSON no formato {{"items":[{{"page_start":1,"page_end":1,"type":
 
 TEXTO:
 {chunk['text']}"""
-    result = openai_json(prompt, 9000)
+    result = gemini_json(prompt, 9000)
     items = result.get("items", [])
     if not isinstance(items, list):
         return []
@@ -366,7 +397,7 @@ Use somente as publicações listadas. Seja factual, conciso e institucional. In
 
 PUBLICAÇÕES:
 {json.dumps(summaries, ensure_ascii=False)}"""
-    return clean_str(openai_json(prompt, 1200).get("summary"))
+    return clean_str(gemini_json(prompt, 1200).get("summary"))
 
 
 def edition_exists(edition_date: str, pdf_hash: str) -> dict[str, Any] | None:
@@ -434,7 +465,7 @@ def process() -> None:
         for number, chunk in enumerate(chunks, start=1):
             print(f"Analisando lote {number}/{len(chunks)} (páginas {chunk['start_page']}–{chunk['end_page']}).")
             all_items.extend(classify_chunk(chunk, edition_date, themes))
-            time.sleep(0.4)
+            time.sleep(7.0)  # Ritmo conservador para respeitar cotas do plano gratuito do Gemini.
 
         deduped: dict[str, dict[str, Any]] = {}
         for item in all_items:

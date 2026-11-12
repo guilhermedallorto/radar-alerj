@@ -13,9 +13,24 @@ Deno.serve(async (req: Request) => {
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) return json({ error: "Autenticação obrigatória." }, 401);
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-  const anonKey = Deno.env.get("SUPABASE_PUBLISHABLE_KEY") || Deno.env.get("SUPABASE_ANON_KEY")!;
-  const supabase = createClient(supabaseUrl, anonKey, {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  let publishableKey = Deno.env.get("SUPABASE_PUBLISHABLE_KEY") || Deno.env.get("SUPABASE_ANON_KEY");
+  // Projetos Supabase mais novos disponibilizam as chaves publicáveis em um mapa JSON.
+  if (!publishableKey) {
+    const publishableKeysJson = Deno.env.get("SUPABASE_PUBLISHABLE_KEYS");
+    if (publishableKeysJson) {
+      try {
+        const publishableKeys = JSON.parse(publishableKeysJson);
+        publishableKey = publishableKeys.default;
+      } catch {
+        return json({ error: "Não foi possível ler a chave publicável do Supabase no ambiente da função." }, 503);
+      }
+    }
+  }
+  if (!supabaseUrl || !publishableKey) {
+    return json({ error: "A configuração de conexão/autenticação do Supabase está incompleta na Edge Function." }, 503);
+  }
+  const supabase = createClient(supabaseUrl, publishableKey, {
     global: { headers: { Authorization: authHeader } },
     auth: { persistSession: false, autoRefreshToken: false },
   });
@@ -55,13 +70,14 @@ Deno.serve(async (req: Request) => {
     source_url: s.source_url,
   }));
 
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!openaiKey) return json({ error: "A chave da API de IA ainda não foi configurada." }, 503);
+  const geminiKey = Deno.env.get("GEMINI_API_KEY");
+  if (!geminiKey) return json({ error: "A chave da API Gemini ainda não foi configurada no Supabase." }, 503);
+  const geminiModel = Deno.env.get("GEMINI_MODEL") || "gemini-3.8-flash";
 
   // Recupera datas das edições pelo identificador, sempre dentro do conjunto visível ao usuário.
   const editionIds = [...new Set(sources.map((s: any) => s.edition_id))];
   const { data: editions } = await supabase.from("editions").select("id,edition_date,edition_label").in("id", editionIds);
-  const dates = new Map((editions || []).map((e: any) => [e.id, e]));
+  const dates = new Map<string, any>((editions || []).map((e: any) => [e.id, e]));
   const groundedSources = compactSources.map((s: any) => {
     const edition = dates.get(s.date);
     return { ...s, edition_date: edition?.edition_date || "data não identificada", edition_label: edition?.edition_label || "" };
@@ -74,16 +90,30 @@ PERGUNTA: ${question}
 PUBLICAÇÕES ENCONTRADAS:
 ${JSON.stringify(groundedSources)}`;
 
-  const aiResponse = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${openaiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: Deno.env.get("OPENAI_MODEL") || "gpt-4.1-mini", input: prompt, max_output_tokens: 2200 }),
-  });
-  if (!aiResponse.ok) return json({ error: `A API de IA retornou HTTP ${aiResponse.status}.` }, 502);
+  const aiResponse = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent`,
+    {
+      method: "POST",
+      headers: { "x-goog-api-key": geminiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 2200 },
+      }),
+    },
+  );
+  if (!aiResponse.ok) {
+    const detail = (await aiResponse.text()).slice(0, 700);
+    return json({ error: `A API Gemini retornou HTTP ${aiResponse.status}: ${detail}` }, 502);
+  }
   const aiData = await aiResponse.json();
-  let answer = aiData.output_text || "";
+  const answer = (aiData.candidates || [])
+    .flatMap((candidate: any) => candidate.content?.parts || [])
+    .filter((part: any) => typeof part.text === "string" && !part.thought)
+    .map((part: any) => part.text)
+    .join("\n")
+    .trim();
   if (!answer) {
-    answer = (aiData.output || []).flatMap((o: any) => o.content || []).filter((c: any) => c.type === "output_text").map((c: any) => c.text).join("\n");
+    return json({ error: "O Gemini não retornou uma resposta textual utilizável." }, 502);
   }
   return json({ answer, sources: groundedSources.map((s: any) => ({ ref: s.ref, title: s.title, kind: s.kind, editionDate: s.edition_date, pageStart: s.page_start, pageEnd: s.page_end, sourceUrl: s.source_url, themes: s.themes })) });
 });

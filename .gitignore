@@ -2,3 +2,5 @@
 *.pdf
 *.sqlite
 __pycache__/
+supabase/functions/.env
+.env.*
