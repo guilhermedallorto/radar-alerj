@@ -16,7 +16,10 @@ from datetime import date, datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
-import fitz
+try:
+    import pymupdf as fitz  # PyMuPDF: API atual
+except ImportError:
+    import fitz  # compatibilidade com versões antigas
 import pytesseract
 import requests
 from bs4 import BeautifulSoup
@@ -88,17 +91,55 @@ def extract_date(soup: BeautifulSoup, selection_url: str) -> date:
 
 
 def find_part_ii_link(html: str, base_url: str) -> str:
+    """Localiza o caderno mesmo quando o portal muda a marcação do link."""
     soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        label = norm(a.get_text(" ", strip=True))
-        if "parte ii" in label and ("poder legislativo" in label or label == "parte ii"):
-            return urljoin(base_url, a["href"])
-    # Alguns templates colocam o título no atributo title.
-    for a in soup.find_all("a", href=True):
-        label = norm(a.get("title", ""))
-        if "parte ii" in label and "legislativo" in label:
-            return urljoin(base_url, a["href"])
-    raise RuntimeError("A página da edição foi localizada, mas o link da Parte II (Poder Legislativo) não foi encontrado.")
+
+    for element in soup.find_all(["a", "button", "area"]):
+        label_parts = [
+            element.get_text(" ", strip=True),
+            element.get("title", ""),
+            element.get("aria-label", ""),
+            element.get("data-original-title", ""),
+            element.get("onclick", ""),
+        ]
+        label = norm(" ".join(str(x) for x in label_parts if x))
+        if "parte ii" not in label:
+            continue
+        if "legislativo" not in label and "poder legislativo" not in label:
+            # O portal também pode abreviar o rótulo visual, mas manter o destino
+            # explícito no href ou no onclick.
+            destination_hint = norm(str(element.get("href", "")) + " " + str(element.get("onclick", "")))
+            if "legislativo" not in destination_hint and "parte_ii" not in destination_hint and "parteii" not in destination_hint:
+                continue
+
+        href = element.get("href") or element.get("data-href") or element.get("data-url")
+        if href and not href.strip().lower().startswith(("javascript:", "#")):
+            return urljoin(base_url, href.strip())
+
+        # Alguns templates implementam os botões por JavaScript.
+        onclick = str(element.get("onclick", ""))
+        match = re.search(r"(?:location(?:\.href)?|open)\s*\(?\s*['\"]([^'\"]+)['\"]", onclick, re.I)
+        if match:
+            return urljoin(base_url, match.group(1))
+        match = re.search(r"['\"]([^'\"]*(?:mostra_edicao|conteudoonline)[^'\"]*)['\"]", onclick, re.I)
+        if match:
+            return urljoin(base_url, match.group(1))
+
+    # Diagnóstico explícito: ajuda a identificar alterações ou respostas
+    # intermediárias (bloqueio, página de erro ou HTML diferente) no portal.
+    visible_links = []
+    for a in soup.find_all("a", href=True)[:35]:
+        text = re.sub(r"\s+", " ", a.get_text(" ", strip=True))[:90]
+        visible_links.append(f"{text!r} -> {a.get('href', '')[:180]}")
+    page_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:500]
+    diagnostic = (
+        f"URL consultada: {base_url}. Título HTML: {soup.title.get_text(' ', strip=True) if soup.title else '(sem título)'}. "
+        f"Texto inicial: {page_text!r}. Links encontrados: {' | '.join(visible_links) or '(nenhum)'}"
+    )
+    raise RuntimeError(
+        "A página da edição foi localizada, mas o link da Parte II (Poder Legislativo) não foi encontrado. "
+        + diagnostic
+    )
 
 
 def discover_latest() -> dict[str, Any]:
