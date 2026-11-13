@@ -4,6 +4,7 @@ O PDF nunca é enviado ao banco nem a qualquer serviço de armazenamento do Rada
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -25,6 +26,7 @@ import pytesseract
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image
+from playwright.async_api import async_playwright
 
 PORTAL = "https://portal.ioerj.com.br/"
 LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima_edicao.php"  # fallback
@@ -230,23 +232,16 @@ def discover_latest_from_calendar() -> tuple[date, str]:
 
 
 def discover_latest() -> dict[str, Any]:
-    # Caminho principal: o calendário de datas. Evita a página de redirecionamento
-    # do_ultima_edicao.php, cujo HTML já causou problemas de codificação/sessão.
+    # Caminho principal: calendário de datas -> página da edição -> link
+    # explicitamente rotulado Parte II (Poder Legislativo).
     try:
         calendar_date, selection_url = discover_latest_from_calendar()
-        latest = http_get(selection_url)  # mesma requests.Session para cookies
-        latest_soup = BeautifulSoup(latest.text, "html.parser")
-        part_url = find_part_ii_link(latest.text, latest.url)
-        edition_date = extract_date(latest_soup, latest.url)
-        if edition_date != calendar_date:
-            print(
-                "Aviso: a data do link do calendário difere da data apresentada na página da edição; "
-                f"calendário={calendar_date.isoformat()}, página={edition_date.isoformat()}."
-            )
     except Exception as calendar_exc:
-        # Fallback de compatibilidade: mantém o caminho anterior caso o calendário
-        # da IOERJ altere sua marcação ou deixe de expor os links de data.
-        print(f"Falha ao localizar a edição pelo calendário ({calendar_exc}); tentando o caminho anterior.")
+        # Só usa o caminho legado se a própria consulta ao calendário falhar.
+        # Se a página de edição existir, mas não trouxer o link da Parte II ou
+        # apresentar data divergente, a coleta deve parar em vez de tentar
+        # adivinhar outro arquivo.
+        print(f"Falha ao localizar uma data pelo calendário ({calendar_exc}); tentando o caminho legado.")
         home = http_get(PORTAL)
         home_soup = BeautifulSoup(home.text, "html.parser")
         last_url = None
@@ -264,10 +259,23 @@ def discover_latest() -> dict[str, Any]:
             latest = http_get(continuation)
         else:
             raise RuntimeError("O portal da IOERJ apresentou redirecionamentos intermediários em excesso.")
-        latest_soup = BeautifulSoup(latest.text, "html.parser")
         selection_url = latest.url
+        latest_soup = BeautifulSoup(latest.text, "html.parser")
         part_url = find_part_ii_link(latest.text, selection_url)
         edition_date = extract_date(latest_soup, selection_url)
+    else:
+        latest = http_get(selection_url)
+        latest_soup = BeautifulSoup(latest.text, "html.parser")
+        # A ausência do link correto é erro fatal; não substitui a Parte II
+        # por outro PDF localizado na página ou em links relacionados.
+        part_url = find_part_ii_link(latest.text, latest.url)
+        edition_date = extract_date(latest_soup, latest.url)
+        if edition_date != calendar_date:
+            raise RuntimeError(
+                "A data da página da edição não corresponde à data codificada no calendário: "
+                f"calendário={calendar_date.isoformat()}; página={edition_date.isoformat()}. "
+                "A coleta foi interrompida para evitar selecionar outra edição."
+            )
 
     label_match = re.search(r"Ano\s+([IVXLCDM]+).*?N[º°o]\s*(\d+)", latest_soup.get_text(" ", strip=True), re.I)
     edition_label = f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}" if label_match else ""
@@ -279,51 +287,287 @@ def discover_latest() -> dict[str, Any]:
     }
 
 
-def find_pdf_and_html(part_url: str) -> tuple[str | None, str, bytes | None]:
-    response = http_get(part_url)
-    content_type = response.headers.get("Content-Type", "").lower()
-    if "pdf" in content_type or response.content[:4] == b"%PDF":
-        return response.url, response.url, response.content
+PDFJS_EXTRACT_JS = r"""
+async () => {
+    const app = window.PDFViewerApplication;
+    if (!app) {
+        return {ok: false, motivo: "PDFViewerApplication não encontrado"};
+    }
+    if (!app.pdfDocument) {
+        return {ok: false, motivo: "Documento ainda não carregado"};
+    }
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    candidates: list[str] = []
-    for element in soup.find_all(["a", "iframe", "embed", "object"]):
-        value = element.get("href") or element.get("src") or element.get("data")
-        label = norm(element.get_text(" ", strip=True) + " " + str(element.get("title", "")))
-        if value and (".pdf" in value.lower() or "pdf" in value.lower() or "baixar" in label or "download" in label or element.name in ("iframe", "embed", "object")):
-            candidates.append(urljoin(response.url, value))
-    # Visualizadores frequentemente escondem o link no JavaScript.
-    candidates.extend(urljoin(response.url, m) for m in re.findall(r"[\"']([^\"']+\.pdf(?:\?[^\"']*)?)[\"']", response.text, re.I))
+    const pdf = app.pdfDocument;
+    const bytes = await pdf.getData();
+    const partes = [];
+    const tamanho = 49152;
 
-    for candidate in dict.fromkeys(candidates):
+    for (let i = 0; i < bytes.length; i += tamanho) {
+        const bloco = bytes.subarray(i, Math.min(i + tamanho, bytes.length));
+        let binario = "";
+        for (let j = 0; j < bloco.length; j += 8192) {
+            binario += String.fromCharCode(...bloco.subarray(j, j + 8192));
+        }
+        partes.push(btoa(binario));
+    }
+
+    return {
+        ok: true,
+        paginas: pdf.numPages,
+        tamanho: bytes.length,
+        base64: partes.join(""),
+        url_visualizador: location.href,
+        titulo: document.title
+    };
+}
+"""
+
+
+async def _extract_pdf_from_pdfjs(part_ii_url: str) -> dict[str, Any]:
+    """Abre o visualizador oficial e recupera os bytes do PDF.js já carregado."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         try:
-            check = http_get(candidate)
-            if "pdf" in check.headers.get("Content-Type", "").lower() or check.content[:4] == b"%PDF":
-                return check.url, response.url, check.content
-            # um iframe pode apontar para outro leitor HTML com PDF embutido
-            inner = BeautifulSoup(check.text, "html.parser")
-            for element in inner.find_all(["iframe", "embed", "object", "a"]):
-                value = element.get("src") or element.get("data") or element.get("href")
-                if value and ".pdf" in value.lower():
-                    nested_url = urljoin(check.url, value)
-                    nested = http_get(nested_url)
-                    if nested.content[:4] == b"%PDF":
-                        return nested.url, response.url, nested.content
-        except Exception:
-            continue
-    # Se a página HTML já contém o texto do caderno, será usado como último recurso.
-    readable = soup.get_text("\n", strip=True)
-    if len(re.sub(r"\s", "", readable)) > 1500:
-        return None, response.url, response.content
-    raise RuntimeError("O link da Parte II foi encontrado, mas não consegui localizar o PDF nem extrair texto substancial da página.")
+            context = await browser.new_context(
+                extra_http_headers={
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                }
+            )
+            page = await context.new_page()
+
+            # Impede que uma cópia antiga em cache ou service worker seja usada.
+            try:
+                cdp = await context.new_cdp_session(page)
+                await cdp.send("Network.enable")
+                await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+                await cdp.send("Network.setBypassServiceWorker", {"bypass": True})
+            except Exception as exc:
+                print(f"Aviso: não foi possível configurar o cache do Chromium: {exc}")
+
+            print(f"Abrindo visualizador da Parte II: {part_ii_url}")
+            response = await page.goto(
+                part_ii_url,
+                wait_until="domcontentloaded",
+                timeout=120000,
+            )
+            if response:
+                print(f"Resposta HTTP do visualizador: {response.status}")
+
+            # Aguarda a inicialização inicial do PDF.js, que pode terminar
+            # alguns segundos depois do carregamento do HTML.
+            await page.wait_for_timeout(10000)
+            extraction = None
+            last_reasons: list[str] = []
+            # O PDF.js pode estar na página principal ou em um iframe.
+            for attempt in range(90):
+                for frame in page.frames:
+                    try:
+                        result = await frame.evaluate(PDFJS_EXTRACT_JS)
+                        if isinstance(result, dict) and result.get("ok"):
+                            extraction = result
+                            break
+                        if isinstance(result, dict) and result.get("motivo"):
+                            last_reasons.append(str(result["motivo"]))
+                    except Exception as exc:
+                        last_reasons.append(f"{frame.url}: {type(exc).__name__}")
+                if extraction:
+                    break
+                await page.wait_for_timeout(2000)
+
+            if not extraction:
+                frame_info = []
+                for frame in page.frames:
+                    try:
+                        info = await frame.evaluate("""() => ({
+                            url: location.href,
+                            titulo: document.title,
+                            pdfViewerApplication: typeof window.PDFViewerApplication,
+                            iframes: Array.from(document.querySelectorAll('iframe')).map(x => x.src),
+                            scripts: Array.from(document.scripts).map(x => x.src).filter(Boolean)
+                        })""")
+                        frame_info.append(info)
+                    except Exception as exc:
+                        frame_info.append({"url": frame.url, "erro": str(exc)[:200]})
+                raise RuntimeError(
+                    "O visualizador da Parte II foi aberto, mas o PDF.js não disponibilizou "
+                    "o documento dentro do prazo de espera. "
+                    f"Últimos diagnósticos: {last_reasons[-8:]}. Frames: {frame_info}"
+                )
+
+            encoded = extraction.get("base64")
+            if not encoded:
+                raise RuntimeError("O PDF.js indicou sucesso, mas não retornou os bytes do documento.")
+
+            pdf_bytes = base64.b64decode(encoded, validate=True)
+            if not pdf_bytes.startswith(b"%PDF"):
+                raise RuntimeError("Os bytes extraídos do visualizador não começam com a assinatura %PDF.")
+            if len(pdf_bytes) != int(extraction.get("tamanho") or -1):
+                raise RuntimeError(
+                    "O tamanho dos bytes extraídos não confere com o tamanho informado pelo PDF.js."
+                )
+
+            # Confere também a contagem de páginas entre o PDF.js e o parser
+            # local, evitando aceitar transferências truncadas ou inconsistentes.
+            try:
+                local_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                local_page_count = len(local_doc)
+                local_doc.close()
+            except Exception as exc:
+                raise RuntimeError(f"PyMuPDF não conseguiu abrir os bytes recebidos do PDF.js: {exc}") from exc
+            if local_page_count != int(extraction.get("paginas") or -1):
+                raise RuntimeError(
+                    "A quantidade de páginas informada pelo PDF.js não confere com o arquivo extraído: "
+                    f"PDF.js={extraction.get('paginas')}; PyMuPDF={local_page_count}."
+                )
+
+            extraction["pdf_bytes"] = pdf_bytes
+            return extraction
+        finally:
+            await browser.close()
+
+
+def find_pdf_and_html(part_url: str) -> tuple[str, str, bytes]:
+    """Extrai o PDF correspondente ao link de Parte II selecionado.
+
+    Não tenta adivinhar arquivos por links genéricos do HTML. Para os links
+    mostra_edicao.php, lê o próprio documento carregado no PDF.js. Se o portal
+    passar a fornecer um PDF direto, aceita-o somente quando o caminho terminar
+    em .pdf; a validação do conteúdo ocorre logo depois, antes do Gemini.
+    """
+    parsed = urlparse(part_url)
+    if parsed.path.lower().endswith(".pdf"):
+        response = http_get(part_url)
+        if not response.content.startswith(b"%PDF"):
+            raise RuntimeError(
+                f"O link direto da Parte II não retornou um PDF válido: {response.url}"
+            )
+        return response.url, part_url, response.content
+
+    extraction = asyncio.run(_extract_pdf_from_pdfjs(part_url))
+    pdf_bytes = extraction.pop("pdf_bytes")
+    print(
+        "PDF extraído do visualizador: "
+        f"{extraction.get('paginas')} páginas; "
+        f"{len(pdf_bytes):,} bytes; título={extraction.get('titulo')!r}; "
+        f"URL={extraction.get('url_visualizador')}"
+    )
+    # O portal não expõe necessariamente uma URL pública do arquivo binário;
+    # a URL de origem verificável é a própria página oficial do visualizador.
+    return str(extraction.get("url_visualizador") or part_url), part_url, pdf_bytes
+
+def validate_part_ii_pdf(pdf_bytes: bytes, expected_date: str | None = None) -> dict[str, Any]:
+    """Confere assinatura, abertura, identificação do caderno e data da edição."""
+    if not isinstance(pdf_bytes, (bytes, bytearray)) or not bytes(pdf_bytes).startswith(b"%PDF"):
+        raise RuntimeError("O conteúdo recebido não é um arquivo PDF válido (assinatura %PDF ausente).")
+
+    try:
+        doc = fitz.open(stream=bytes(pdf_bytes), filetype="pdf")
+    except Exception as exc:
+        raise RuntimeError(f"Não foi possível abrir o PDF extraído do visualizador: {exc}") from exc
+
+    try:
+        if doc.is_encrypted:
+            raise RuntimeError("O PDF da Parte II está criptografado.")
+        if len(doc) < 1:
+            raise RuntimeError("O PDF extraído não contém páginas.")
+
+        first_page_text = doc[0].get_text("text", sort=False)
+        first_norm = norm(first_page_text)
+        required_markers = {
+            "identificação Parte II": "parte ii" in first_norm,
+            "identificação Poder Legislativo": "poder legislativo" in first_norm,
+            "identificação Assembleia Legislativa": "assembleia legislativa" in first_norm,
+        }
+        missing = [label for label, found in required_markers.items() if not found]
+        if missing:
+            excerpt = re.sub(r"\s+", " ", first_page_text)[:900]
+            raise RuntimeError(
+                "O PDF localizado não passou na validação de identidade da Parte II — Poder Legislativo. "
+                f"Marcadores ausentes: {', '.join(missing)}. Início da primeira página: {excerpt!r}"
+            )
+
+        months = {
+            "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5,
+            "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+            "outubro": 10, "novembro": 11, "dezembro": 12,
+        }
+        date_match = re.search(
+            r"\b(\d{1,2})\s+de\s+(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})\b",
+            first_norm,
+        )
+        document_date = None
+        if date_match:
+            document_date = date(
+                int(date_match.group(3)),
+                months[date_match.group(2)],
+                int(date_match.group(1)),
+            ).isoformat()
+        if expected_date and document_date and document_date != expected_date:
+            raise RuntimeError(
+                "A data impressa no PDF não corresponde à edição selecionada no calendário: "
+                f"calendário={expected_date}; primeira página={document_date}."
+            )
+        if expected_date and not document_date:
+            raise RuntimeError(
+                "Não foi possível confirmar a data impressa na primeira página do PDF; "
+                "a coleta foi interrompida para evitar processar uma edição diferente."
+            )
+
+        metadata = doc.metadata or {}
+        return {
+            "page_count": len(doc),
+            "document_date": document_date,
+            "title": metadata.get("title"),
+            "author": metadata.get("author"),
+            "creator": metadata.get("creator"),
+        }
+    finally:
+        doc.close()
 
 
 def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
+    """Extrai o texto por coluna, na ordem de leitura do Diário Oficial.
+
+    A Parte II é diagramada em três colunas. A extração linear com sort=True
+    pode intercalar trechos de colunas diferentes; por isso, os blocos são
+    separados pelas mesmas faixas horizontais usadas na conferência manual.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: list[dict[str, Any]] = []
     for index, page in enumerate(doc, start=1):
-        text = page.get_text("text", sort=True).strip()
-        # OCR só nas páginas em que a camada textual está ausente ou muito curta.
+        width = page.rect.width
+        limit_1 = width * 0.347
+        limit_2 = width * 0.645
+        columns: list[list[tuple[float, float, str]]] = [[], [], []]
+
+        for block in page.get_text("blocks", sort=False):
+            if len(block) < 5:
+                continue
+            x0, y0, _x1, _y1, raw_text = block[:5]
+            text = str(raw_text or "").strip()
+            if not text or y0 < 75:
+                continue  # cabeçalho repetido; a capa é validada separadamente
+            text = re.sub(r"(?<=\w)-[ \t]*\n[ \t]*(?=\w)", "", text)
+            if x0 < limit_1:
+                column_index = 0
+            elif x0 < limit_2:
+                column_index = 1
+            else:
+                column_index = 2
+            columns[column_index].append((float(y0), float(x0), text))
+
+        column_texts = []
+        for column in columns:
+            column.sort(key=lambda item: (item[0], item[1]))
+            if column:
+                column_texts.append("\n".join(item[2] for item in column))
+        text = "\n\n".join(column_texts).strip()
+
+        # OCR apenas como contingência para páginas sem camada textual útil.
         if len(re.sub(r"\s", "", text)) < 35:
             pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
@@ -333,11 +577,11 @@ def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
                     text = ocr.strip()
             except Exception as exc:
                 print(f"OCR não disponível na página {index}: {exc}")
+
         if text:
             pages.append({"page": index, "text": text})
     doc.close()
     return pages
-
 
 def html_pages(html_bytes: bytes) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html_bytes, "html.parser")
@@ -419,7 +663,7 @@ def log_run(status: str, message: str, edition_date: str | None = None, total: i
         db_post("ingestion_runs", {"status": status, "edition_date": edition_date, "message": message, "finished_at": finished, "publications_found": total, "publications_relevant": relevant})
 
 
-def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
+def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
     """Solicita JSON ao Gemini com backoff para 429/503 e falhas de rede/timeout."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     payload = {
@@ -488,10 +732,16 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any]:
             "Gemini não devolveu texto utilizável. "
             f"Motivo de bloqueio: {feedback or 'não informado'}; conclusão: {finish_reason or 'sem candidato'}."
         )
+    # O Gemini pode respeitar o schema conceitual e ainda devolver a lista
+    # diretamente, em vez do invólucro {"items": [...]}. Ambos são aceitos;
+    # cada etapa valida o formato que efetivamente espera.
+    candidate_json = output.strip()
+    if candidate_json.startswith("```"):
+        candidate_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate_json, flags=re.I).strip()
     try:
-        parsed = json.loads(output)
-        if not isinstance(parsed, dict):
-            raise ValueError("A resposta JSON não é um objeto.")
+        parsed = json.loads(candidate_json)
+        if not isinstance(parsed, (dict, list)):
+            raise ValueError("A resposta JSON deve ser um objeto ou uma lista.")
         return parsed
     except Exception as exc:
         raise RuntimeError(f"O Gemini não devolveu JSON válido: {output[:800]}") from exc
@@ -526,10 +776,19 @@ RETORNE SOMENTE JSON no formato {{"items":[{{"page_start":1,"page_end":1,"type":
 TEXTO:
 {chunk['text']}"""
     result = gemini_json(prompt, 9000)
-    items = result.get("items", [])
+    if isinstance(result, list):
+        # Formato observado na execução: array de publicações na raiz.
+        items = result
+        print("Aviso: Gemini retornou uma lista na raiz; formato normalizado para items.")
+    elif isinstance(result, dict):
+        items = result.get("items", [])
+    else:
+        raise RuntimeError("A classificação do Gemini não retornou um objeto nem uma lista.")
     if not isinstance(items, list):
-        return []
+        raise RuntimeError("A classificação do Gemini não contém uma lista válida em 'items'.")
     for item in items:
+        if not isinstance(item, dict):
+            raise RuntimeError("A lista de publicações do Gemini contém um item que não é objeto JSON.")
         if item.get("page_start") is None:
             item["page_start"] = chunk.get("start_page")
         if item.get("page_end") is None:
@@ -560,7 +819,13 @@ Use somente as publicações listadas. Seja factual, conciso e institucional. In
 
 PUBLICAÇÕES:
 {json.dumps(summaries, ensure_ascii=False)}"""
-    return clean_str(gemini_json(prompt, 1200).get("summary"))
+    result = gemini_json(prompt, 1200)
+    if isinstance(result, dict) and clean_str(result.get("summary")):
+        return clean_str(result.get("summary"))
+    return (
+        f"A edição de {edition_date} foi processada e contém {len(publications)} publicações. "
+        "A síntese automática não foi disponibilizada nesta execução; consulte os registros individuais."
+    )
 
 
 def edition_exists(edition_date: str, pdf_hash: str) -> dict[str, Any] | None:
@@ -577,58 +842,47 @@ def process() -> None:
     run_rows = db_post("ingestion_runs", {"status": "running", "message": "Iniciando localização da última edição."})
     run_id = run_rows[0]["id"] if run_rows else None
     edition_date = None
+    existing = None
+    preserve_processed_edition = False
     try:
         source = discover_latest()
         edition_date = source["edition_date"]
-        print(f"Edição detectada: {edition_date} — {source['edition_label']}")
+        print(f"Edição detectada no calendário: {edition_date} — {source['edition_label']}")
+        print(f"Página de seleção da edição: {source['selection_url']}")
+        print(f"Link identificado como Parte II — Poder Legislativo: {source['part_ii_url']}")
+
         pdf_url, part_url, content = find_pdf_and_html(source["part_ii_url"])
+        pdf_info = validate_part_ii_pdf(content, expected_date=edition_date)
+        pdf_hash = sha256(content)
+        print(
+            "Validação do PDF aprovada: Parte II — Poder Legislativo; "
+            f"data impressa={pdf_info['document_date']}; páginas={pdf_info['page_count']}; "
+            f"autor={pdf_info.get('author')!r}; criador={pdf_info.get('creator')!r}."
+        )
+        print(f"URL do visualizador/arquivo-fonte: {pdf_url}")
 
-        if content and content[:4] == b"%PDF":
-            pdf_hash = sha256(content)
-            existing = edition_exists(edition_date, pdf_hash)
-            if existing and existing.get("status") == "processed":
-                log_run("success", "Edição já processada; nenhuma duplicidade criada.", edition_date, run_id=run_id)
-                print("Edição já processada. Encerrando.")
-                return
-            pages = extract_pdf_pages(content)
-            source_pdf_url = pdf_url
-        else:
-            pdf_hash = sha256(content or b"")
-            existing = edition_exists(edition_date, pdf_hash)
-            if existing and existing.get("status") == "processed":
-                log_run("success", "Edição HTML já processada; nenhuma duplicidade criada.", edition_date, run_id=run_id)
-                return
-            pages = html_pages(content or b"")
-            source_pdf_url = None
+        existing = edition_exists(edition_date, pdf_hash)
+        if existing and existing.get("pdf_sha256") == pdf_hash and existing.get("status") == "processed":
+            log_run("success", "Edição já processada; nenhuma duplicidade criada.", edition_date, run_id=run_id)
+            print("Edição já processada. Encerrando.")
+            return
+        preserve_processed_edition = bool(existing and existing.get("status") == "processed")
 
-        if not pages or sum(len(p["text"]) for p in pages) < 500:
-            raise RuntimeError("Não foi extraído texto suficiente do caderno. A edição não foi marcada como processada.")
-
-        edition_payload = {
-            "edition_date": edition_date,
-            "edition_label": source["edition_label"],
-            "source_page_url": source["part_ii_url"],
-            "source_pdf_url": source_pdf_url or source["part_ii_url"],
-            "pdf_sha256": pdf_hash,
-            "status": "found",
-            "collected_at": datetime.now(timezone.utc).isoformat(),
-            "error": None,
-        }
-        # Se a IOERJ substituir uma edição ou se uma tentativa anterior falhou,
-        # remove os atos parciais/antigos daquela edição antes de reprocessar.
-        if existing:
-            db_delete("publications", {"edition_id": f"eq.{existing['id']}"})
-
-        edition_rows = db_post("editions", edition_payload, on_conflict="edition_date")
-        edition_id = edition_rows[0]["id"] if edition_rows else db_get("editions", {"select": "id", "edition_date": f"eq.{edition_date}", "limit": "1"})[0]["id"]
+        pages = extract_pdf_pages(content)
+        if not pages or sum(len(page["text"]) for page in pages) < 500:
+            raise RuntimeError("Não foi extraído texto suficiente do PDF da Parte II. A edição não foi marcada como processada.")
 
         themes = load_themes()
         chunks = make_chunks(pages)
+        if not chunks:
+            raise RuntimeError("Não foi possível criar lotes de texto a partir do PDF da Parte II.")
+
         all_items: list[dict[str, Any]] = []
         for number, chunk in enumerate(chunks, start=1):
             print(f"Analisando lote {number}/{len(chunks)} (páginas {chunk['start_page']}–{chunk['end_page']}).")
             all_items.extend(classify_chunk(chunk, edition_date, themes))
-            time.sleep(7.0)  # Ritmo conservador para respeitar cotas do plano gratuito do Gemini.
+            if number < len(chunks):
+                time.sleep(7.0)  # Ritmo conservador para respeitar cotas do plano gratuito do Gemini.
 
         deduped: dict[str, dict[str, Any]] = {}
         for item in all_items:
@@ -641,13 +895,18 @@ def process() -> None:
                 deduped[key] = item
 
         publications = list(deduped.values())
+        if not publications:
+            raise RuntimeError(
+                "O Gemini não segmentou nenhuma publicação a partir do PDF validado. "
+                "A edição anterior, caso exista, foi preservada."
+            )
+
         rows = []
         relevant_count = 0
         for item in publications:
             relevant = bool(item.get("relevant")) and bool(item.get("matched_themes"))
             relevant_count += int(relevant)
             rows.append({
-                "edition_id": edition_id,
                 "external_key": publication_key(edition_date, item),
                 "page_start": item.get("page_start"),
                 "page_end": item.get("page_end"),
@@ -663,18 +922,73 @@ def process() -> None:
                 "confidence": item.get("confidence"),
                 "justification": clean_str(item.get("justification")) if relevant else None,
                 "summary": clean_str(item.get("summary")) if relevant else None,
-                "source_url": source["part_ii_url"],
+                "source_url": part_url,
             })
 
-        # Upsert por lotes para evitar limites de payload do PostgREST.
+        try:
+            summary = daily_summary(edition_date, publications)
+        except Exception as summary_exc:
+            print(f"Aviso: não foi possível gerar a síntese diária; os atos serão preservados: {summary_exc}")
+            summary = (
+                f"A edição de {edition_date} foi processada e contém {len(publications)} publicações. "
+                "A síntese automática não foi disponibilizada nesta execução; consulte os registros individuais."
+            )
+
+        # Só altera a edição no banco depois de concluir a extração e toda a
+        # análise de IA. Assim, uma falha de navegador/Gemini não apaga dados
+        # existentes nem marca uma edição antiga como erro.
+        edition_payload = {
+            "edition_date": edition_date,
+            "edition_label": source["edition_label"],
+            "source_page_url": source["selection_url"],
+            "source_pdf_url": pdf_url,
+            "pdf_sha256": pdf_hash,
+            "status": "found",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "error": None,
+        }
+        edition_rows = db_post("editions", edition_payload, on_conflict="edition_date")
+        if edition_rows:
+            edition_id = edition_rows[0]["id"]
+        else:
+            found = db_get("editions", {"select": "id", "edition_date": f"eq.{edition_date}", "limit": "1"})
+            if not found:
+                raise RuntimeError("A edição foi processada, mas não foi possível recuperar seu ID no Supabase.")
+            edition_id = found[0]["id"]
+
+        for row in rows:
+            row["edition_id"] = edition_id
+
+        # Primeiro grava todos os itens novos/atualizados. Só depois remove
+        # publicações antigas que não pertençam mais ao PDF validado.
         for offset in range(0, len(rows), 60):
             db_post("publications", rows[offset:offset + 60], on_conflict="external_key")
 
-        summary = daily_summary(edition_date, publications) if publications else "Não foi possível identificar publicações no texto extraído."
+        desired_keys = {row["external_key"] for row in rows}
+        existing_publications = db_get(
+            "publications",
+            {"select": "id,external_key", "edition_id": f"eq.{edition_id}", "limit": "5000"},
+        ) or []
+        obsolete_ids = [
+            row["id"] for row in existing_publications
+            if row.get("external_key") not in desired_keys
+        ]
+        for offset in range(0, len(obsolete_ids), 100):
+            id_list = ",".join(obsolete_ids[offset:offset + 100])
+            db_delete("publications", {"id": f"in.({id_list})"})
+
         db_patch("editions", {"id": f"eq.{edition_id}"}, {
-            "status": "processed", "processed_at": datetime.now(timezone.utc).isoformat(),
-            "publication_count": len(rows), "relevant_count": relevant_count,
-            "daily_summary": summary, "error": None,
+            "edition_label": source["edition_label"],
+            "source_page_url": source["selection_url"],
+            "source_pdf_url": pdf_url,
+            "pdf_sha256": pdf_hash,
+            "status": "processed",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "publication_count": len(rows),
+            "relevant_count": relevant_count,
+            "daily_summary": summary,
+            "error": None,
         })
         log_run("success", f"Edição processada. {len(rows)} publicações; {relevant_count} relevantes. PDF não armazenado.", edition_date, len(rows), relevant_count, run_id)
         print(f"Concluído: {len(rows)} atos, {relevant_count} relevantes. PDF descartado ao final do processo.")
@@ -683,7 +997,9 @@ def process() -> None:
         message = f"Falha na coleta/processamento: {exc}"
         print(message, file=sys.stderr)
         try:
-            if edition_date:
+            # Não altera o status de uma edição que já estava processada: em
+            # reprocessamentos malsucedidos, seus dados continuam válidos.
+            if edition_date and not preserve_processed_edition:
                 db_patch("editions", {"edition_date": f"eq.{edition_date}"}, {"status": "error", "error": message})
             log_run("error", message, edition_date, run_id=run_id)
         except Exception as log_exc:

@@ -14,7 +14,7 @@ permissions:
 jobs:
   collect-and-process:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Baixar código
         uses: actions/checkout@v4
@@ -26,13 +26,16 @@ jobs:
           cache: pip
           cache-dependency-path: worker/requirements.txt
 
-      - name: Instalar OCR em português
+      - name: Instalar dependências do sistema
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-por
 
-      - name: Instalar dependências
+      - name: Instalar dependências Python
         run: pip install -r worker/requirements.txt
+
+      - name: Instalar Chromium para o visualizador PDF.js da IOERJ
+        run: python -m playwright install --with-deps chromium
 
       - name: Consultar IOERJ, processar e atualizar o banco
         env:
