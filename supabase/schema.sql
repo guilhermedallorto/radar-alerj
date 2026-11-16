@@ -1,11 +1,13 @@
--- Radar Legislativo ALERJ — Supabase schema v2
+-- Radar Legislativo ALERJ — Supabase schema v3 (temas por usuário e edições extras)
 -- Execute no SQL Editor de um projeto Supabase novo.
 
 create extension if not exists pgcrypto;
 
 create table if not exists public.editions (
   id uuid primary key default gen_random_uuid(),
-  edition_date date not null unique,
+  edition_date date not null,
+  edition_type text not null default 'regular' check (edition_type in ('regular','extra')),
+  edition_key text not null default 'regular',
   edition_label text,
   source_page_url text not null,
   source_pdf_url text,
@@ -23,15 +25,17 @@ create table if not exists public.editions (
 
 create table if not exists public.themes (
   id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
   active boolean not null default true,
-  name text not null unique,
+  name text not null,
   description text not null default '',
   keywords text[] not null default '{}',
   include_criteria text not null default '',
   exclude_criteria text not null default '',
   priority integer not null default 3 check (priority between 1 and 5),
   created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint themes_user_name_key unique (user_id, name)
 );
 
 create table if not exists public.publications (
@@ -70,7 +74,8 @@ create index if not exists publications_edition_idx on public.publications (edit
 create index if not exists publications_relevance_idx on public.publications (ai_relevant, manual_relevance);
 create index if not exists publications_search_idx on public.publications using gin (search_vector);
 create index if not exists publications_created_idx on public.publications (created_at desc);
-create index if not exists themes_active_idx on public.themes (active, priority);
+create index if not exists themes_user_active_priority_idx on public.themes (user_id, active, priority);
+create unique index if not exists editions_date_key_idx on public.editions (edition_date, edition_key);
 
 create table if not exists public.ingestion_runs (
   id uuid primary key default gen_random_uuid(),
@@ -78,10 +83,50 @@ create table if not exists public.ingestion_runs (
   finished_at timestamptz,
   status text not null check (status in ('running','success','warning','error')),
   edition_date date,
+  edition_type text not null default 'regular' check (edition_type in ('regular','extra')),
+  edition_key text,
   message text,
   publications_found integer not null default 0,
   publications_relevant integer not null default 0
 );
+
+create table if not exists public.user_edition_analyses (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  edition_id uuid not null references public.editions(id) on delete cascade,
+  theme_signature text not null,
+  status text not null default 'processing' check (status in ('processing','processed','error')),
+  publication_count integer not null default 0,
+  relevant_count integer not null default 0,
+  summary text,
+  error text,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  updated_at timestamptz not null default now(),
+  constraint user_edition_analyses_user_edition_key unique (user_id, edition_id)
+);
+
+create table if not exists public.user_publication_matches (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  edition_id uuid not null references public.editions(id) on delete cascade,
+  publication_id uuid not null references public.publications(id) on delete cascade,
+  theme_signature text not null,
+  relevant boolean not null default false,
+  matched_themes jsonb not null default '[]'::jsonb,
+  confidence numeric(4,3),
+  justification text,
+  summary text,
+  manual_relevance boolean,
+  manual_note text,
+  reviewed_at timestamptz,
+  updated_at timestamptz not null default now(),
+  constraint user_publication_matches_user_publication_key unique (user_id, publication_id)
+);
+
+create index if not exists user_edition_analyses_user_idx on public.user_edition_analyses (user_id, updated_at desc);
+create index if not exists user_publication_matches_user_edition_idx on public.user_publication_matches (user_id, edition_id);
+create index if not exists user_publication_matches_publication_idx on public.user_publication_matches (publication_id);
 
 -- Atualização automática do updated_at.
 create or replace function public.set_updated_at()
@@ -98,6 +143,14 @@ for each row execute function public.set_updated_at();
 
 drop trigger if exists themes_set_updated_at on public.themes;
 create trigger themes_set_updated_at before update on public.themes
+for each row execute function public.set_updated_at();
+
+drop trigger if exists user_edition_analyses_set_updated_at on public.user_edition_analyses;
+create trigger user_edition_analyses_set_updated_at before update on public.user_edition_analyses
+for each row execute function public.set_updated_at();
+
+drop trigger if exists user_publication_matches_set_updated_at on public.user_publication_matches;
+create trigger user_publication_matches_set_updated_at before update on public.user_publication_matches
 for each row execute function public.set_updated_at();
 
 drop trigger if exists publications_set_updated_at on public.publications;
@@ -122,15 +175,20 @@ alter table public.editions enable row level security;
 alter table public.themes enable row level security;
 alter table public.publications enable row level security;
 alter table public.ingestion_runs enable row level security;
+alter table public.user_edition_analyses enable row level security;
+alter table public.user_publication_matches enable row level security;
 
-revoke all on public.editions, public.themes, public.publications, public.ingestion_runs from anon;
-revoke all on public.editions, public.themes, public.publications, public.ingestion_runs from authenticated;
+revoke all on public.editions, public.themes, public.publications, public.ingestion_runs,
+  public.user_edition_analyses, public.user_publication_matches from anon;
+revoke all on public.editions, public.themes, public.publications, public.ingestion_runs,
+  public.user_edition_analyses, public.user_publication_matches from authenticated;
 
 grant select on public.editions, public.ingestion_runs to authenticated;
 grant select, insert, update, delete on public.themes to authenticated;
+grant select, insert, update, delete on public.user_edition_analyses, public.user_publication_matches to authenticated;
 grant select on public.publications to authenticated;
-grant update (manual_relevance, manual_note, reviewed_by, reviewed_at) on public.publications to authenticated;
-grant all on public.editions, public.themes, public.publications, public.ingestion_runs to service_role;
+grant all on public.editions, public.themes, public.publications, public.ingestion_runs,
+  public.user_edition_analyses, public.user_publication_matches to service_role;
 grant execute on function public.search_publications(text, integer) to authenticated;
 
 -- Qualquer conta criada manualmente pelo administrador pode acessar os dados.
@@ -144,19 +202,31 @@ create policy runs_read_authenticated on public.ingestion_runs for select to aut
 using ((select auth.uid()) is not null);
 
 drop policy if exists themes_all_authenticated on public.themes;
-create policy themes_all_authenticated on public.themes for all to authenticated
-using ((select auth.uid()) is not null)
-with check ((select auth.uid()) is not null);
+drop policy if exists themes_owner_only on public.themes;
+create policy themes_owner_only on public.themes for all to authenticated
+using (user_id = (select auth.uid()))
+with check (user_id = (select auth.uid()));
+
+drop policy if exists user_edition_analyses_owner_only on public.user_edition_analyses;
+create policy user_edition_analyses_owner_only on public.user_edition_analyses for all to authenticated
+using (user_id = (select auth.uid()))
+with check (user_id = (select auth.uid()));
+
+drop policy if exists user_publication_matches_owner_only on public.user_publication_matches;
+create policy user_publication_matches_owner_only on public.user_publication_matches for all to authenticated
+using (user_id = (select auth.uid()))
+with check (user_id = (select auth.uid()));
 
 drop policy if exists publications_read_authenticated on public.publications;
 create policy publications_read_authenticated on public.publications for select to authenticated
 using ((select auth.uid()) is not null);
 
-drop policy if exists publications_review_authenticated on public.publications;
-create policy publications_review_authenticated on public.publications for update to authenticated
-using ((select auth.uid()) is not null)
-with check ((select auth.uid()) is not null);
 
-comment on table public.editions is 'Metadados e resumo das edições da Parte II. Não armazena arquivos PDF.';
+comment on table public.editions is 'Metadados de edições regulares e extras da Parte II. Não armazena arquivos PDF.';
+comment on column public.editions.edition_type is 'regular = caderno diário normal; extra = caderno identificado pela IOERJ como EDIÇÃO EXTRA.';
+comment on column public.editions.edition_key is 'Identificador estável do caderno dentro da data; permite múltiplas edições extras no mesmo dia.';
 comment on column public.editions.source_pdf_url is 'URL oficial do PDF na IOERJ; o arquivo não é copiado para o Radar.';
 comment on table public.publications is 'Atos individualizados; body_text guarda texto extraído, não o PDF original.';
+
+comment on table public.user_edition_analyses is 'Resumo e estado da análise temática específica de cada usuário e edição.';
+comment on table public.user_publication_matches is 'Classificação e revisão privada por usuário e publicação.';

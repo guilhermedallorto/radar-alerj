@@ -1,2 +1,5 @@
 [functions.ask-radar]
 verify_jwt = true
+
+[functions.analyze-user-themes]
+verify_jwt = true

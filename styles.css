@@ -3,3 +3,22 @@
 @media(max-width:780px){.wrap{width:min(100% - 28px,1180px)}.topline{padding:0 14px;font-size:8px}.masthead{padding:20px 0 17px;align-items:flex-start}.brand-mark{width:43px;height:43px;font-size:10px}.brand-lockup{gap:11px}.brand-lockup h1{font-size:18px}.header-actions{gap:7px;flex-direction:column;align-items:flex-end}.header-actions .small{display:none}.nav-tab{padding:11px 12px;font-size:11px}.search-strip{align-items:flex-start;flex-direction:column;gap:7px}.daily-heading{align-items:flex-start;flex-direction:column}.daily-heading h2{font-size:24px}.stat-grid{grid-template-columns:repeat(2,1fr)}.highlight-grid,.other-groups{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.field.span-2,.field.span-3{grid-column:span 1}.publication-row{grid-template-columns:1fr;gap:4px}.publication-row .pub-date{order:2}.history-item{grid-template-columns:1fr 1fr;gap:7px}.footer-inner{flex-direction:column}.research-actions{align-items:flex-start;flex-direction:column}.theme-item{flex-direction:column}.theme-item .theme-actions{justify-content:flex-start}.login-card{padding:32px 24px}}
 
 .load-more-wrap{display:flex;justify-content:center;padding:18px 0}.load-more-wrap .btn{min-width:220px}
+
+/* Separação visual entre edições regulares e extras na área de acompanhamento. */
+.edition-tabs{display:flex;flex-direction:column;gap:13px;margin:13px 0 22px}
+.edition-tabs-group{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid var(--line)}
+.edition-tabs-label{width:100%;font-size:9px;letter-spacing:1.2px;font-weight:700;color:var(--muted);margin-bottom:2px}
+.edition-extra-tag{display:inline-flex;align-items:center;background:#f4e8e6;color:#9a463f;padding:3px 6px;font-size:8px;letter-spacing:.65px;font-weight:800;white-space:nowrap}
+@media(max-width:780px){.edition-tabs-group{align-items:stretch}.edition-tabs-group .edition-tab{flex:1 1 105px}}
+
+
+/* Situação das duas rotinas automáticas: edição regular e busca da edição extra. */
+.edition-check-status{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:-7px 0 19px}
+.edition-check{display:grid;grid-template-columns:1fr auto;gap:4px 9px;align-items:center;background:rgba(255,254,250,.72);border:1px solid var(--line);padding:9px 11px;min-width:0}
+.edition-check-title{font-size:10px;font-weight:800;letter-spacing:.7px;color:var(--navy);text-transform:uppercase}
+.edition-check-time{font-size:9px;color:var(--muted);text-align:right}
+.edition-check .status-pill{justify-self:start}
+.edition-check small{grid-column:1/-1;font-size:9px;color:var(--muted);overflow-wrap:anywhere}
+@media(max-width:780px){.edition-check-status{grid-template-columns:1fr}}
+
+.status-pill.warning{background:#fff4d6;color:#805b00;border:1px solid #e7c66a}

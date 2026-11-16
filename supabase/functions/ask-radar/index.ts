@@ -57,30 +57,42 @@ Deno.serve(async (req: Request) => {
     return json({ answer: "Não encontrei publicações que correspondam aos termos da pergunta no acervo processado. Experimente indicar um município, número de projeto, órgão, autor ou expressão mais específica.", sources: [] });
   }
 
-  const compactSources = sources.map((s: any, i: number) => ({
-    ref: i + 1,
-    date: s.edition_id,
-    title: s.title,
-    kind: s.kind,
-    page_start: s.page_start,
-    page_end: s.page_end,
-    summary: s.summary,
-    themes: s.matched_themes,
-    excerpt: String(s.body_text || "").slice(0, 1700),
-    source_url: s.source_url,
-  }));
+  const sourceIds = sources.map((s: any) => s.id);
+  const { data: userMatches } = await supabase
+    .from("user_publication_matches")
+    .select("publication_id,relevant,matched_themes,summary,justification")
+    .in("publication_id", sourceIds);
+  const matchByPublication = new Map((userMatches || []).map((m: any) => [m.publication_id, m]));
+
+  const compactSources = sources.map((s: any, i: number) => {
+    const userMatch = matchByPublication.get(s.id) as any;
+    return {
+      ref: i + 1,
+      date: s.edition_id,
+      title: s.title,
+      kind: s.kind,
+      page_start: s.page_start,
+      page_end: s.page_end,
+      summary: userMatch?.summary || "",
+      themes: userMatch?.matched_themes || [],
+      justification: userMatch?.justification || "",
+      relevant_for_user: Boolean(userMatch?.relevant),
+      excerpt: String(s.body_text || "").slice(0, 1700),
+      source_url: s.source_url,
+    };
+  });
 
   const geminiKey = Deno.env.get("GEMINI_API_KEY");
   if (!geminiKey) return json({ error: "A chave da API Gemini ainda não foi configurada no Supabase." }, 503);
-  const geminiModel = Deno.env.get("GEMINI_MODEL") || "gemini-3.8-flash";
+  const geminiModel = Deno.env.get("GEMINI_MODEL") || "gemini-3.1-flash-lite";
 
   // Recupera datas das edições pelo identificador, sempre dentro do conjunto visível ao usuário.
   const editionIds = [...new Set(sources.map((s: any) => s.edition_id))];
-  const { data: editions } = await supabase.from("editions").select("id,edition_date,edition_label").in("id", editionIds);
+  const { data: editions } = await supabase.from("editions").select("id,edition_date,edition_label,edition_type").in("id", editionIds);
   const dates = new Map<string, any>((editions || []).map((e: any) => [e.id, e]));
   const groundedSources = compactSources.map((s: any) => {
     const edition = dates.get(s.date);
-    return { ...s, edition_date: edition?.edition_date || "data não identificada", edition_label: edition?.edition_label || "" };
+    return { ...s, edition_date: edition?.edition_date || "data não identificada", edition_label: edition?.edition_label || "", edition_type: edition?.edition_type || "regular" };
   });
 
   const prompt = `Você é o assistente de pesquisa documental do Radar Legislativo ALERJ. Responda à pergunta usando EXCLUSIVAMENTE as publicações fornecidas abaixo. Não use conhecimento externo para completar lacunas. Se as fontes não permitirem responder, diga isso claramente. Não invente datas, números, autores, resultados, relações ou conclusões. Distinga publicação de projeto apresentado, parecer, votação, sanção e promulgação. Sempre cite as fontes no corpo como [1], [2] etc., correspondendo exatamente ao campo ref. Ao final, não crie bibliografia separada; a interface mostrará as fontes abaixo.
@@ -115,7 +127,7 @@ ${JSON.stringify(groundedSources)}`;
   if (!answer) {
     return json({ error: "O Gemini não retornou uma resposta textual utilizável." }, 502);
   }
-  return json({ answer, sources: groundedSources.map((s: any) => ({ ref: s.ref, title: s.title, kind: s.kind, editionDate: s.edition_date, pageStart: s.page_start, pageEnd: s.page_end, sourceUrl: s.source_url, themes: s.themes })) });
+  return json({ answer, sources: groundedSources.map((s: any) => ({ ref: s.ref, title: s.title, kind: s.kind, editionDate: s.edition_date, editionType: s.edition_type, pageStart: s.page_start, pageEnd: s.page_end, sourceUrl: s.source_url, themes: s.themes })) });
 });
 
 function json(value: unknown, status = 200) {

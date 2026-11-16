@@ -1,111 +1,95 @@
-# Especificação — Radar Legislativo ALERJ v2.0
+# Especificação — Radar Legislativo ALERJ
 
 ## 1. Objetivo
 
-Aplicação privada para acompanhar exclusivamente a Parte II — Poder Legislativo do Diário Oficial do Estado do Rio de Janeiro. A experiência principal é o site; a planilha deixa de ser dependência. O banco guarda o acervo textual e seus metadados, mas **não guarda cópias de PDFs**.
+Aplicação privada para acompanhar todas as publicações da **Parte II — Poder Legislativo** do Diário Oficial do Estado do Rio de Janeiro. O site é a interface principal. O banco guarda metadados e texto extraído, mas **não guarda cópias dos PDFs**.
 
-## 2. Requisitos confirmados
+## 2. Requisitos funcionais
 
-- Abrangência: todas as publicações identificadas na Parte II.
-- Resumos por IA: resumos individuais apenas para publicações relacionadas aos temas ativos.
-- Acesso: privado, com autenticação e bloqueio de consultas anônimas no banco.
-- Fonte: página de última edição da IOERJ → link Parte II (Poder Legislativo).
-- PDFs: consulta/download direto da IOERJ; não são armazenados pelo Radar.
-- Temas: cadastro editável no próprio site, com descrição, palavras-chave, critérios de inclusão/exclusão, prioridade e ativação.
+- Abrangência: todas as publicações da Parte II, tanto da edição regular quanto de eventual edição extra.
+- Coleta regular: todos os dias às 9h05 (`America/Sao_Paulo`).
+- Checagem de edição extra: todos os dias às 22h (`America/Sao_Paulo`), restrita à data corrente.
+- Temas: cada usuário autenticado mantém temas e critérios próprios; nenhuma classificação temática ou revisão humana é compartilhada entre contas.
+- Análise: a segmentação documental é feita uma vez por edição. As edições extras novas são classificadas na rotina noturna, separadamente para cada conta com temas cadastrados; edições regulares e históricas não analisadas são classificadas quando o usuário as abre.
+- Acesso: privado, com autenticação e políticas de Row Level Security.
+- Fonte: calendário/página de seleção de data da IOERJ → link Parte II (Poder Legislativo), distinguindo o rótulo `EDIÇÃO EXTRA`.
+- PDFs: extraídos diretamente do visualizador e mantidos apenas em memória/temporariamente no runner; nunca enviados ao Storage do Radar.
 
 ## 3. Arquitetura
 
 | Camada | Serviço | Responsabilidade |
 |---|---|---|
-| Interface | HTML/CSS/JS estático | Boletim diário, filtros, fichas, pesquisa, gestão de temas |
-| Hospedagem | GitHub Pages | Entrega dos arquivos do site |
-| Autenticação | Supabase Auth | Login de usuários previamente criados pelo administrador |
-| Banco | Supabase PostgreSQL | Edições, atos, temas, resumos, revisões e logs |
-| Coleta programada | GitHub Actions | Execução diária, com botão de execução manual |
-| Extração | Python + PyMuPDF + Tesseract | Extrai texto por página; aplica OCR quando necessário |
-| IA | Gemini API (`generateContent`) | Segmentação, classificação, resumos e respostas de pesquisa |
-| Pesquisa | PostgreSQL FTS + Edge Function | Recupera atos e responde com fontes citadas |
+| Interface | HTML/CSS/JS estático | Leitura, busca, fichas, gestão de temas, acompanhamento de edições |
+| Hospedagem | GitHub Pages | Entrega dos arquivos estáticos |
+| Autenticação | Supabase Auth | Login de contas previamente criadas pelo administrador |
+| Banco | Supabase PostgreSQL | Edições, publicações, temas por usuário, análises particulares e logs |
+| Coleta | GitHub Actions | Execução às 9h05 e 22h, além de execução manual |
+| Extração | Python, Playwright/Chromium, PyMuPDF e Tesseract | Abertura do PDF.js, extração por página e OCR quando necessário |
+| IA | Gemini API | Segmentação comum, classificação personalizada e pesquisa |
+| Funções | Supabase Edge Functions | Análise temática autenticada por usuário e pesquisa contextual |
 
 ### Fluxo de dados
 
-1. Workflow agenda e inicia `worker/ingest.py`.
-2. Coletor acessa o portal da IOERJ, segue o redirecionamento de última edição e localiza a Parte II.
-3. PDF é baixado para memória no runner, não é escrito no Supabase Storage, Drive ou repositório.
-4. PyMuPDF extrai texto por página; Tesseract OCR é acionado nas páginas sem texto útil.
-5. Texto é dividido em lotes e enviado à IA para segmentação e classificação.
-6. Todas as publicações são gravadas em `publications`; resumo individual/justificativa só ficam preenchidos quando `ai_relevant=true`.
-7. Uma síntese geral da edição é gravada em `editions.daily_summary`.
-8. PDF bytes deixam de existir quando a execução termina; o banco preserva apenas o link oficial e o hash do documento.
-9. O site lê o banco após login e apresenta links oficiais para abrir/baixar o PDF.
+1. O workflow da manhã consulta o calendário e seleciona a Parte II regular mais recente.
+2. O workflow das 22h consulta o dia corrente e recolhe todos os links da Parte II identificados como `EDIÇÃO EXTRA`, podendo processar vários cadernos na mesma data.
+3. O worker abre o visualizador PDF.js, recupera os bytes do documento, valida a assinatura, a identificação da Parte II e a data impressa.
+4. PyMuPDF extrai texto por página; Tesseract OCR é aplicado quando necessário.
+5. O Gemini segmenta o texto em publicações individuais. Nesta etapa, não há classificação por temas de gabinete.
+6. O acervo de publicações é gravado no Supabase, com chave própria para cada caderno, permitindo várias extras na mesma data.
+7. Para edições extras, após a segmentação o worker classifica o documento separadamente para cada conta com temas cadastrados e grava o resultado sob o respectivo `user_id`. Para edições regulares e históricas ainda não analisadas, `analyze-user-themes` executa a classificação quando o usuário abre a edição, usando somente os temas permitidos pela sessão.
+8. A análise individual é armazenada e reutilizada enquanto o conjunto de temas e o conteúdo da edição permanecerem iguais.
+9. `ask-radar` pesquisa o acervo e utiliza as correspondências temáticas do usuário autenticado, quando existentes.
 
 ## 4. Modelo de dados
 
 ### `editions`
-Data da edição (chave única), rótulo/ano/número, URL da página da Parte II, URL do PDF oficial, hash, situação da coleta, timestamps, contagem de atos, contagem de relevantes, resumo geral e eventual erro.
+Metadados da edição, incluindo `edition_date` e `edition_type` (`regular` ou `extra`), rótulo, URLs oficiais, hash do PDF, estado e contagem de publicações. A chave única é a combinação de data e `edition_key`: a edição regular usa `regular`, e cada edição extra recebe uma chave própria derivada do PDF. Assim, duas ou mais extras podem coexistir na mesma data.
 
 ### `publications`
-Chave estável de deduplicação, edição, páginas, tipo, título, texto integral extraído, órgão, pessoas, municípios, valores, classificação automática, temas correspondentes, confiança, justificativa, resumo, fonte, revisão humana e observações.
+Publicações identificadas, vinculadas a uma edição, com páginas, tipo, título, texto integral, órgão, pessoas, municípios, valores e fonte. Os campos históricos de relevância global permanecem por compatibilidade, mas não são utilizados para produzir destaques personalizados.
 
 ### `themes`
-Nome, ativo/inativo, descrição, palavras-chave, critérios de inclusão/exclusão e prioridade.
+Temas, descrição, palavras-chave, critérios e prioridade, vinculados obrigatoriamente a `user_id`. A RLS permite ao usuário acessar apenas as próprias linhas.
+
+### `user_edition_analyses`
+Estado e síntese da análise por combinação usuário/edição, incluindo assinatura dos temas e da versão do conteúdo analisado.
+
+### `user_publication_matches`
+Classificação por usuário/publicação, temas correspondentes, resumo, justificativa e eventual revisão humana particular.
 
 ### `ingestion_runs`
-Histórico de início/fim, situação, data da edição, mensagem e totais processados.
+Histórico operacional, incluindo data, tipo de edição verificada (regular/extra), chave opcional do caderno, estado e mensagem. A verificação das 22h grava também um resumo consolidado do resultado da busca extra.
 
 ## 5. Experiência do usuário
 
-### Leitura diária
-Masthead editorial; navegação horizontal; pesquisa global; temas monitorados com contadores; seletor das últimas edições; data e link oficial; síntese geral da edição; indicadores; destaques individuais em cartões contendo resumo, tipo, páginas, órgão, autoria, temas e “por que importa”; demais atos agrupados por tipo.
-
-### Publicações
-Consulta de todas as publicações, busca full-text em português, filtros de relevância e edição, ficha individual e link oficial.
-
-### Temas monitorados
-CRUD de temas; critérios semânticos e palavras-chave; prioridade; ativação/desativação.
-
-### Pesquisa no acervo
-Pergunta em linguagem natural, recuperação textual no PostgreSQL, resposta da IA baseada exclusivamente nas publicações recuperadas, links e páginas das fontes.
-
-### Edições
-Histórico de edições, totais, estado de processamento, mensagem de falha e link oficial.
-
-### Revisão humana
-Usuário autenticado pode marcar ato como relevante/irrelevante e registrar nota. A revisão prevalece na exibição sobre o julgamento automático.
+- **Leitura diária:** mostra as edições regulares e extras em grupos separados, com dois indicadores de execução: coleta regular e busca de edição extra.
+- **Destaques:** cada conta recebe classificação, temas correspondentes, resumo e justificativa próprios.
+- **Publicações:** o acervo integral permanece consultável. Edições regulares/históricas que o usuário ainda não abriu aparecem como `Ainda não analisada para seus temas`, sem serem tratadas como irrelevantes. Edições extras são pré-analisadas para as contas com temas cadastrados na checagem das 22h.
+- **Temas monitorados:** CRUD de temas por conta, com descrição, critérios, prioridade e ativação/desativação.
+- **Pesquisa:** resposta fundamentada no acervo, com indicação das fontes, data, página e eventual marca de edição extra.
+- **Histórico:** edição extra aparece em grupo próprio e recebe identificação explícita.
+- **Revisão humana:** a marcação de relevante/irrelevante e a observação pertencem apenas ao usuário que as registrou.
 
 ## 6. Segurança e privacidade
 
-- Frontend não contém segredo administrativo nem chave da API Gemini.
-- Usuários são criados manualmente; cadastro público deve permanecer desabilitado.
-- RLS bloqueia qualquer leitura anônima e permite leitura a usuários autenticados.
-- Apenas o backend de coleta possui a service role key.
-- A Edge Function de pesquisa exige JWT.
-- Repositório contém `config.example.js` e `config.js`; este último contém somente o Project URL e a chave publicável do Supabase, que pode ser exposta no frontend quando as políticas RLS estão corretamente configuradas. Nenhuma chave administrativa ou da API Gemini pode ser incluída no repositório.
-- GitHub Pages torna os arquivos estáticos e a tela de login públicos. O conteúdo do banco continua protegido por Auth/RLS. Para ocultar também os arquivos estáticos, acrescentar uma camada de controle de acesso na hospedagem.
+- Nenhuma chave administrativa ou chave Gemini é incluída no frontend.
+- Usuários são criados manualmente; o cadastro público deve permanecer desabilitado.
+- RLS restringe `themes`, `user_edition_analyses` e `user_publication_matches` ao `user_id` autenticado.
+- Classificações e revisões particulares não são gravadas na linha compartilhada de `publications`.
+- O worker utiliza a chave de serviço apenas no ambiente GitHub Actions.
+- Edge Functions de análise e pesquisa exigem JWT válido.
+- O `config.js` contém apenas URL e chave publicável do Supabase.
 
-## 7. Retenção
+## 7. Personalização e consumo da API
 
-- Sem retenção de PDF ou arquivo de imagem do PDF.
-- Retenção de texto de cada ato, necessário para pesquisa e consulta histórica.
-- Armazenamento de URL oficial e hash do PDF para rastreabilidade.
-- Histórico de edições e execuções mantido no Supabase.
+A migração transforma os temas existentes em cópias individuais para cada conta já cadastrada. A partir daí, alterações em uma conta não afetam outra. Novas contas começam sem temas configurados.
 
-## 8. Rotina
+Para edições regulares e históricas, a análise temática é feita quando o usuário abre uma edição, evitando chamadas Gemini para usuários que não consultam determinado caderno. Para edições extras novas, a rotina das 22h percorre as contas com temas cadastrados e calcula a classificação individualmente antes de gravá-la sob o respectivo `user_id`. Se uma análise individual falhar, a edição documental continua processada, a análise dessa conta fica em erro e pode ser refeita quando o usuário abrir a edição. Alterações em temas recalculam a edição atualmente aberta; edições anteriores são recalculadas quando forem selecionadas. O cache reduz chamadas repetidas, mas o consumo da API depende da quantidade de usuários, temas e publicações.
 
-Workflow programado diariamente às 09h15 no fuso `America/Sao_Paulo`. O horário é aproximado porque o GitHub pode atrasar jobs de cron. Execução manual disponível por `workflow_dispatch`.
+## 8. Limitações
 
-## 9. Limitações v2.0
-
-- A primeira coleta manual deve confirmar o caminho de navegação e o PDF atual da IOERJ.
-- Mudanças no HTML/visualizador da IOERJ podem demandar ajuste do coletor.
-- OCR depende da qualidade do PDF.
-- Segmentação/identificação de páginas pela IA precisa de amostragem e revisão humana.
-- A troca de critérios de tema não reprocessa automaticamente o acervo histórico nesta entrega; os novos critérios serão usados nas coletas seguintes.
-- A busca é full-text lexical em português, não busca vetorial.
-- O número de atos e o resumo não substituem o documento original.
-
-
-## 10. Configuração do Gemini
-
-A coleta (GitHub Actions) e a pesquisa (Supabase Edge Function `ask-radar`) utilizam a mesma chave Gemini, cadastrada separadamente em cada ambiente como `GEMINI_API_KEY`. O modelo é configurável por `GEMINI_MODEL`; padrão: `gemini-3.8-flash`. A migração do provedor não altera o schema PostgreSQL.
-
-A modalidade gratuita do Gemini está sujeita a limites de taxa e pode utilizar conteúdo enviado para aprimoramento dos produtos do Google. O projeto deve evitar o envio de dados pessoais ou conteúdo interno sigiloso.
+- A checagem extra é prospectiva e consulta a data corrente; não importa automaticamente edições extras históricas.
+- Se o portal IOERJ alterar HTML, links ou o visualizador, o coletor poderá exigir ajuste. Ele interrompe a execução quando não consegue validar o documento, em vez de processar outro caderno silenciosamente.
+- OCR, segmentação documental e classificação temática por IA devem ser conferidos em publicações importantes no documento oficial.
+- A pesquisa é baseada em busca textual do PostgreSQL e síntese com IA; não é uma busca vetorial semântica.
+- O número de atos e os resumos não substituem o Diário Oficial original.

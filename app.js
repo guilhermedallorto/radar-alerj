@@ -19,6 +19,8 @@
   let selectedTheme = '';
   let currentView = 'daily';
   let latestRun = null;
+  let ingestionRuns = [];
+  let currentAnalysis = null;
   let publicationOffset = 0;
   let publicationPageSize = 100;
 
@@ -29,7 +31,44 @@
   function isRelevant(pub) {
     if (pub.manual_relevance === true) return true;
     if (pub.manual_relevance === false) return false;
-    return !!pub.ai_relevant;
+    return !!pub.user_relevant;
+  }
+  function mergeUserMatch(pub, match, analysisStatus = null) {
+    return {
+      ...pub,
+      user_relevant: !!match?.relevant,
+      user_matched_themes: Array.isArray(match?.matched_themes) ? match.matched_themes : [],
+      user_summary: match?.summary || '',
+      user_justification: match?.justification || '',
+      manual_relevance: match?.manual_relevance ?? null,
+      manual_note: match?.manual_note || '',
+      reviewed_at: match?.reviewed_at || null,
+      theme_signature: match?.theme_signature || '',
+      user_analysis_status: analysisStatus || (match ? 'processed' : null)
+    };
+  }
+  async function attachUserMatches(publications) {
+    const ids = publications.map(p => p.id).filter(Boolean);
+    if (!ids.length) return publications.map(p => mergeUserMatch(p, null));
+    const editionIds = [...new Set(publications.map(p => p.edition_id).filter(Boolean))];
+    const [matchResult, analysisResult] = await Promise.all([
+      client.from('user_publication_matches')
+        .select('publication_id,relevant,matched_themes,summary,justification,manual_relevance,manual_note,reviewed_at,theme_signature')
+        .in('publication_id', ids),
+      editionIds.length
+        ? client.from('user_edition_analyses').select('edition_id,status').in('edition_id', editionIds)
+        : Promise.resolve({ data: [], error: null })
+    ]);
+    if (matchResult.error) throw matchResult.error;
+    if (analysisResult.error) throw analysisResult.error;
+    const byId = new Map((matchResult.data || []).map(m => [m.publication_id, m]));
+    const statusByEdition = new Map((analysisResult.data || []).map(a => [a.edition_id, a.status]));
+    return publications.map(p => {
+      const status = statusByEdition.get(p.edition_id) || null;
+      const candidate = byId.get(p.id);
+      const match = status === 'processed' || candidate?.manual_relevance !== null && candidate?.manual_relevance !== undefined ? candidate : null;
+      return mergeUserMatch(p, match, status);
+    });
   }
   function pageText(p) {
     if (p.page_start && p.page_end && p.page_start !== p.page_end) return `pp. ${p.page_start}–${p.page_end}`;
@@ -37,20 +76,21 @@
     return 'página não identificada';
   }
   function publicationTags(pub) {
-    const names = Array.isArray(pub.matched_themes) ? pub.matched_themes : [];
+    const names = Array.isArray(pub.user_matched_themes) ? pub.user_matched_themes : [];
     return names.map(name => `<span class="tag">${esc(name)}</span>`).join(' ');
   }
   function renderCard(pub) {
     const rel = isRelevant(pub);
-    const summary = rel && pub.summary ? pub.summary : (pub.body_text || '').slice(0, 300) + ((pub.body_text || '').length > 300 ? '…' : '');
+    const itemSummary = pub.user_summary;
+    const summary = rel && itemSummary ? itemSummary : (pub.body_text || '').slice(0, 300) + ((pub.body_text || '').length > 300 ? '…' : '');
     const auth = pub.organization ? `Órgão: ${esc(pub.organization)}` : 'Órgão não identificado';
     const people = Array.isArray(pub.people) && pub.people.length ? ` · ${esc(pub.people.slice(0,4).join(', '))}` : '';
     return `<article class="highlight-card">
-      <div class="card-top"><span class="tag ${rel?'green':'neutral'}">${rel ? 'Destaque para o gabinete' : esc(pub.kind || 'Publicação')}</span><span class="page-ref">${esc(pageText(pub))}</span></div>
+      <div class="card-top"><span class="tag ${rel?'green':'neutral'}">${rel ? 'Destaque dos seus temas' : esc(pub.kind || 'Publicação')}</span><span class="page-ref">${esc(pageText(pub))}</span></div>
       <h3>${esc(pub.title || 'Publicação sem título')}</h3>
       <p class="summary">${esc(summary)}</p>
       <div class="metadata">${auth}${people} · ${esc(fmtDate(pub.editions?.edition_date || currentEdition?.edition_date))}</div>
-      ${rel && pub.justification ? `<div class="why-box"><strong>Por que importa</strong>${esc(pub.justification)}</div>` : ''}
+      ${rel && pub.user_justification ? `<div class="why-box"><strong>Por que importa</strong>${esc(pub.user_justification)}</div>` : ''}
       <div class="card-actions"><button data-open-pub="${esc(pub.id)}">Ler publicação →</button><button data-review="${esc(pub.id)}">Revisar classificação</button></div>
     </article>`;
   }
@@ -97,13 +137,15 @@
     const [edRes, themeRes, runRes] = await Promise.all([
       client.from('editions').select('*').order('edition_date', { ascending:false }).limit(30),
       client.from('themes').select('*').order('priority', { ascending:true }).order('name'),
-      client.from('ingestion_runs').select('*').order('started_at', { ascending:false }).limit(1)
+      client.from('ingestion_runs').select('*').order('started_at', { ascending:false }).limit(30)
     ]);
     if (edRes.error) throw edRes.error;
     if (themeRes.error) throw themeRes.error;
-    editions = edRes.data || []; themes = themeRes.data || []; latestRun = runRes.data?.[0] || null;
-    $('last-read').textContent = runRes.data?.[0]?.finished_at ? `Última coleta: ${fmtDate(runRes.data[0].finished_at)} · ${esc(runRes.data[0].status)}` : 'Aguardando a primeira coleta';
-    renderTopicRow(); renderEditionTabs(); renderHistory(latestRun);
+    if (runRes.error) throw runRes.error;
+    editions = (edRes.data || []).sort((a,b) => String(b.edition_date).localeCompare(String(a.edition_date)) || ((a.edition_type === 'extra' ? 1 : 0) - (b.edition_type === 'extra' ? 1 : 0)));
+    themes = themeRes.data || []; ingestionRuns = runRes.data || []; latestRun = ingestionRuns[0] || null;
+    $('last-read').textContent = latestRun ? `Última verificação: ${fmtDate(latestRun.started_at,{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})} · ${latestRun.status}` : 'Aguardando a primeira coleta';
+    renderTopicRow(); renderEditionTabs(); renderEditionChecks(); renderHistory(latestRun);
     if (editions.length) await selectEdition(editions[0].id);
     else renderEmptyDashboard();
   }
@@ -117,34 +159,84 @@
   function renderTopicRow() {
     const active = themes.filter(t => t.active);
     const counts = {};
-    currentPubs.forEach(p => (Array.isArray(p.matched_themes)?p.matched_themes:[]).forEach(n => counts[n]=(counts[n]||0)+1));
+    currentPubs.forEach(p => (Array.isArray(p.user_matched_themes)?p.user_matched_themes:[]).forEach(n => counts[n]=(counts[n]||0)+1));
     $('topic-row').innerHTML = `<span class="topic-label">MONITORAMENTO</span>${active.length ? active.map(t=>`<button class="topic-pill" data-topic-filter="${esc(t.name)}">${esc(t.name)} <strong>${counts[t.name]||0}</strong></button>`).join('') : '<span class="muted tiny">Nenhum tema ativo. Cadastre temas para personalizar o Radar.</span>'}`;
   }
+  function renderEditionChecks() {
+    const latestByType = {};
+    for (const run of ingestionRuns) {
+      const type = run.edition_type || 'regular';
+      if (!latestByType[type]) latestByType[type] = run;
+    }
+    const renderCheck = (type, title, timeLabel) => {
+      const run = latestByType[type];
+      if (!run) return `<div class="edition-check"><span class="edition-check-title">${title}</span><span class="status-pill">Ainda não verificada</span></div>`;
+      const statusLabel = run.status === 'success' ? 'Concluída' : run.status === 'warning' ? 'Concluída com avisos' : run.status === 'running' ? 'Em andamento' : run.status === 'error' ? 'Erro' : run.status;
+      const detail = run.message || (run.publications_found ? `${run.publications_found} publicações identificadas.` : 'Verificação registrada.');
+      return `<div class="edition-check"><span class="edition-check-title">${title}</span><span class="edition-check-time">${timeLabel} · ${esc(fmtDate(run.started_at,{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}))}</span><span class="status-pill ${run.status==='error'?'error':run.status==='warning'?'warning':''}">${esc(statusLabel)}</span><small>${esc(detail)}</small></div>`;
+    };
+    const node = $('edition-check-status');
+    if (node) node.innerHTML = renderCheck('regular','Edição regular','Checagem diária') + renderCheck('extra','Edição extra','Verificação adicional');
+  }
   function renderEditionTabs() {
-    $('edition-tabs').innerHTML = editions.slice(0,10).map(e=>`<button class="edition-tab ${currentEdition?.id===e.id?'active':''}" data-edition="${esc(e.id)}"><strong>${esc(fmtDate(e.edition_date,{day:'2-digit',month:'short'}))}</strong><small>${Number(e.publication_count||0)} atos · ${Number(e.relevant_count||0)} destaques</small></button>`).join('');
+    const regular = editions.filter(e => (e.edition_type || 'regular') === 'regular').slice(0, 10);
+    const extra = editions.filter(e => e.edition_type === 'extra').slice(0, 10);
+    const renderGroup = (items, label, type) => `<div class="edition-tabs-group"><div class="edition-tabs-label">${label}</div>${items.length ? items.map(e=>`<button class="edition-tab ${currentEdition?.id===e.id?'active':''}" data-edition="${esc(e.id)}"><strong>${esc(fmtDate(e.edition_date,{day:'2-digit',month:'short'}))}</strong><small>${type==='extra'?`<span class="edition-extra-tag">${esc((e.edition_label||'').match(/EDIÇÃO EXTRA\s+\d+/i)?.[0]||'EDIÇÃO EXTRA')}</span> · `:''}${Number(e.publication_count||0)} atos</small></button>`).join('') : `<span class="muted tiny">${type==='extra'?'Nenhuma edição extra localizada.':'Nenhuma edição regular localizada.'}</span>`}</div>`;
+    $('edition-tabs').innerHTML = renderGroup(regular, 'EDIÇÕES REGULARES', 'regular') + renderGroup(extra, 'EDIÇÕES EXTRAS', 'extra');
   }
   async function selectEdition(id) {
     currentEdition = editions.find(e => e.id === id) || null;
+    currentAnalysis = null;
     if (!currentEdition) return;
-    const { data, error } = await client.from('publications').select('*').eq('edition_id', id).order('page_start', {ascending:true}).limit(1200);
+    const { data, error } = await client.from('publications').select('*').eq('edition_id', id).order('page_start', {ascending:true}).limit(3000);
     if (error) throw error;
-    currentPubs = data || [];
+    currentPubs = (data || []).map(p => mergeUserMatch(p, null));
+    renderEditionTabs();
+    $('highlights').innerHTML = '<div class="empty-state">Analisando esta edição de acordo com os seus temas personalizados…</div>';
+    $('daily-summary').textContent = 'A análise personalizada está sendo preparada para os seus temas.';
+
+    try {
+      const { data: analysisResponse, error: functionError } = await client.functions.invoke('analyze-user-themes', { body: { edition_id: id } });
+      if (functionError) throw functionError;
+      if (analysisResponse?.error) throw new Error(analysisResponse.error);
+    } catch (analysisError) {
+      console.error('Falha na análise temática do usuário:', analysisError);
+      currentAnalysis = { status: 'error', error: analysisError.message || String(analysisError) };
+      toast(`Não foi possível analisar os temas desta edição: ${currentAnalysis.error}`);
+    }
+
+    const [matchResult, analysisResult] = await Promise.all([
+      client.from('user_publication_matches').select('*').eq('edition_id', id),
+      client.from('user_edition_analyses').select('*').eq('edition_id', id).maybeSingle()
+    ]);
+    if (matchResult.error) throw matchResult.error;
+    if (analysisResult.error) throw analysisResult.error;
+    if (analysisResult.data?.status === 'error') currentAnalysis = analysisResult.data;
+    else if (analysisResult.data && currentAnalysis?.status !== 'error') currentAnalysis = analysisResult.data;
+    const matchRows = (matchResult.data || []).filter(m => currentAnalysis?.status === 'processed' || m.manual_relevance !== null && m.manual_relevance !== undefined);
+    const matchByPublication = new Map(matchRows.map(m => [m.publication_id, m]));
+    const editionAnalysisStatus = analysisResult.data?.status || currentAnalysis?.status || null;
+    currentPubs = currentPubs.map(p => mergeUserMatch(p, matchByPublication.get(p.id), editionAnalysisStatus));
     renderEditionTabs(); renderTopicRow(); renderDaily();
   }
   function renderDaily() {
     const e = currentEdition;
     $('edition-weekday').textContent = e ? fmtDate(e.edition_date,{weekday:'long'}) : 'EDIÇÃO SELECIONADA';
     $('edition-title').textContent = e ? fmtDate(e.edition_date,{weekday:'long',day:'numeric',month:'long',year:'numeric'}) : 'Leitura diária';
-    $('edition-subtitle').textContent = e ? `${e.edition_label || 'Parte II · Poder Legislativo'} · ${e.status==='processed'?'edição processada':e.status==='error'?'falha no processamento':'em processamento'}` : '';
+    const extraLabel = e?.edition_type === 'extra' && !String(e?.edition_label || '').toUpperCase().includes('EDIÇÃO EXTRA') ? 'EDIÇÃO EXTRA · ' : '';
+    $('edition-subtitle').textContent = e ? `${extraLabel}${e.edition_label || 'Parte II · Poder Legislativo'} · ${e.status==='processed'?'edição processada':e.status==='error'?'falha no processamento':'em processamento'}` : '';
     $('edition-source').href = safeUrl(e?.source_pdf_url || e?.source_page_url || '#');
-    $('daily-summary').textContent = e?.daily_summary || (e?.status==='error' ? `A última tentativa de processamento falhou: ${e.error || 'erro não detalhado'}` : 'A síntese ainda não foi gerada para esta edição.');
+    if (currentAnalysis?.status === 'error') {
+      $('daily-summary').textContent = `Não foi possível concluir a análise dos seus temas nesta edição: ${currentAnalysis.error || 'erro não detalhado'}. O texto integral das publicações continua disponível no acervo.`;
+    } else {
+      $('daily-summary').textContent = currentAnalysis?.summary || (e?.status==='error' ? `A coleta falhou: ${e.error || 'erro não detalhado'}` : 'A análise personalizada desta edição ainda não foi concluída para sua conta.');
+    }
     const relevant = currentPubs.filter(isRelevant);
-    const counts = themes.filter(t=>t.active).map(t=>({name:t.name,count:currentPubs.filter(p=>isRelevant(p)&&(p.matched_themes||[]).includes(t.name)).length}));
     $('edition-stats').innerHTML = [
-      [currentPubs.length,'Publicações identificadas'],[relevant.length,'Destaques para o gabinete'],[themes.filter(t=>t.active).length,'Temas ativos'],[e?.status==='processed'?'Concluída':(e?.status||'—'),'Situação da coleta']
+      [currentPubs.length,'Publicações identificadas'],[relevant.length,'Destaques dos seus temas'],[themes.filter(t=>t.active).length,'Temas ativos'],[e?.status==='processed'?'Concluída':(e?.status||'—'),'Situação da coleta']
     ].map(([n,l])=>`<div class="stat-card"><span class="stat-number">${esc(n)}</span><span class="stat-label">${esc(l)}</span></div>`).join('');
-    $('highlights').innerHTML = relevant.length ? relevant.slice(0,12).map(renderCard).join('') : '<div class="empty-state">Nenhuma publicação foi classificada como relevante para os temas ativos nesta edição. O acervo completo permanece disponível abaixo.</div>';
-    $('highlight-count').textContent = `${relevant.length} publicação(ões) relevantes nesta edição`;
+    $('highlights').innerHTML = relevant.length ? relevant.slice(0,12).map(renderCard).join('') : `<div class="empty-state">${themes.some(t=>t.active) ? 'Nenhuma publicação foi classificada como relevante para os seus temas ativos nesta edição. O acervo completo permanece disponível abaixo.' : 'Você ainda não possui temas ativos. Cadastre seus temas para receber destaques personalizados.'}</div>`;
+    $('highlight-count').textContent = `${relevant.length} publicação(ões) relevantes para os seus temas nesta edição`;
     const others = currentPubs.filter(p=>!isRelevant(p));
     const grouped = others.reduce((acc,p)=>{const k=p.kind||'Outras publicações';(acc[k]=acc[k]||[]).push(p);return acc;},{});
     const groups = Object.entries(grouped).sort((a,b)=>b[1].length-a[1].length);
@@ -155,18 +247,23 @@
     const query = $('publication-query').value.trim();
     const status = $('publication-filter').value;
     const edition = $('publication-date').value;
-    let req = client.from('publications').select('*, editions(edition_date,edition_label)').order('created_at',{ascending:false}).range(publicationOffset, publicationOffset + publicationPageSize - 1);
+    let req = client.from('publications').select('*, editions(edition_date,edition_type,edition_label)').order('created_at',{ascending:false}).range(publicationOffset, publicationOffset + publicationPageSize - 1);
     if (edition !== 'all') req = req.eq('edition_id', edition);
     if (query) req = req.textSearch('search_vector', query, {type:'websearch',config:'portuguese'});
     const {data,error} = await req;
     if (error) {toast(`Falha na pesquisa: ${error.message}`);return;}
-    const page = data || [];
+    const page = await attachUserMatches(data || []);
     publicationOffset += page.length;
     let items = page;
     if (status==='relevant') items = items.filter(isRelevant);
-    if (status==='other') items = items.filter(p=>!isRelevant(p));
-    if (selectedTheme) items = items.filter(p=>(p.matched_themes||[]).includes(selectedTheme));
-    const html = items.map(p=>`<article class="publication-row"><div class="pub-date">${esc(fmtDate(p.editions?.edition_date))}<br>${esc(pageText(p))}</div><div><h3>${esc(p.title)}</h3><p>${esc((p.summary || p.body_text || '').slice(0,280))}${(p.summary||p.body_text||'').length>280?'…':''}</p><div class="pub-meta"><span class="tag ${isRelevant(p)?'green':'neutral'}">${isRelevant(p)?'Relevante':'Demais atos'}</span>${publicationTags(p)}<span class="tiny muted">${esc(p.kind||'')}</span></div></div><button class="text-button" data-open-pub="${esc(p.id)}">Abrir →</button></article>`).join('');
+    if (status==='other') items = items.filter(p=>p.user_analysis_status==='processed' && !isRelevant(p));
+    if (selectedTheme) items = items.filter(p=>(p.user_matched_themes||[]).includes(selectedTheme));
+    const html = items.map(p=>{
+      const relevanceLabel = isRelevant(p) ? 'Relevante para você' : p.user_analysis_status === 'processed' ? (themes.some(t=>t.active) ? 'Não corresponde aos seus temas' : 'Nenhum tema ativo') : 'Ainda não analisada para seus temas';
+      const tagClass = isRelevant(p) ? 'green' : 'neutral';
+      const excerpt = p.user_summary || p.body_text || '';
+      return `<article class="publication-row"><div class="pub-date">${esc(fmtDate(p.editions?.edition_date))}${p.editions?.edition_type==='extra'?`<br><span class="edition-extra-tag">${esc((p.editions?.edition_label||'').match(/EDIÇÃO EXTRA\s+\d+/i)?.[0]||'EDIÇÃO EXTRA')}</span>`:''}<br>${esc(pageText(p))}</div><div><h3>${esc(p.title)}</h3><p>${esc(excerpt.slice(0,280))}${excerpt.length>280?'…':''}</p><div class="pub-meta"><span class="tag ${tagClass}">${relevanceLabel}</span>${publicationTags(p)}<span class="tiny muted">${esc(p.kind||'')}</span></div></div><button class="text-button" data-open-pub="${esc(p.id)}">Abrir →</button></article>`;
+    }).join('');
     if (append) $('publication-results').insertAdjacentHTML('beforeend', html);
     else $('publication-results').innerHTML = html || '<div class="empty-state">Nenhuma publicação encontrada com esses filtros.</div>';
     $('pub-load-more').classList.toggle('hidden', page.length < publicationPageSize);
@@ -180,12 +277,12 @@
   async function saveTheme(event) {
     event.preventDefault();
     const id = $('theme-id').value;
-    const payload = {name:$('theme-name').value.trim(),description:$('theme-description').value.trim(),keywords:$('theme-keywords').value.split(',').map(x=>x.trim()).filter(Boolean),include_criteria:$('theme-include').value.trim(),exclude_criteria:$('theme-exclude').value.trim(),priority:Number($('theme-priority').value),active:$('theme-active').checked};
+    const payload = {user_id:currentUser.id,name:$('theme-name').value.trim(),description:$('theme-description').value.trim(),keywords:$('theme-keywords').value.split(',').map(x=>x.trim()).filter(Boolean),include_criteria:$('theme-include').value.trim(),exclude_criteria:$('theme-exclude').value.trim(),priority:Number($('theme-priority').value),active:$('theme-active').checked};
     if (!payload.name) return;
     const result = id ? await client.from('themes').update(payload).eq('id',id) : await client.from('themes').insert(payload);
     if (result.error) {toast(`Não foi possível salvar o tema: ${result.error.message}`);return;}
     const refreshed = await client.from('themes').select('*').order('priority');
-    themes = refreshed.data || []; clearThemeForm(); renderThemes(); renderTopicRow(); toast('Tema salvo. Ele será considerado na próxima coleta automática.');
+    themes = refreshed.data || []; clearThemeForm(); renderThemes(); renderTopicRow(); if(currentEdition) await selectEdition(currentEdition.id); toast('Tema salvo. Os destaques desta edição foram recalculados para sua conta.');
   }
   async function editTheme(id) {
     const t=themes.find(x=>x.id===id); if(!t)return;
@@ -196,24 +293,47 @@
     const t=themes.find(x=>x.id===id); if(!t)return;
     const {error}=await client.from('themes').update({active:!t.active}).eq('id',id);
     if(error){toast(error.message);return;}
-    t.active=!t.active;renderThemes();renderTopicRow();toast(`Tema ${t.active?'ativado':'desativado'}.`);
+    t.active=!t.active;renderThemes();renderTopicRow();if(currentEdition)await selectEdition(currentEdition.id);toast(`Tema ${t.active?'ativado':'desativado'}.`);
   }
   async function openPublication(id) {
-    const {data,error}=await client.from('publications').select('*, editions(edition_date,edition_label,source_pdf_url)').eq('id',id).single();
+    const {data,error}=await client.from('publications').select('*, editions(edition_date,edition_type,edition_label,source_pdf_url)').eq('id',id).single();
     if(error){toast(error.message);return;}
-    const p=data; const rel=isRelevant(p); const editUrl=safeUrl(p.editions?.source_pdf_url||p.source_url);
-    $('modal-content').innerHTML=`<div class="section-kicker">${esc(p.kind||'PUBLICAÇÃO')} · ${esc(fmtDate(p.editions?.edition_date))}</div><h2 id="modal-title">${esc(p.title)}</h2><p class="muted tiny">${esc(pageText(p))} · ${esc(p.organization||'Órgão não identificado')}</p><div class="pub-meta">${rel?'<span class="tag green">Relevante</span>':'<span class="tag neutral">Demais atos</span>'}${publicationTags(p)}</div>${p.summary?`<div class="why-box"><strong>Resumo</strong>${esc(p.summary)}</div>`:''}${p.justification?`<div class="why-box"><strong>Por que importa</strong>${esc(p.justification)}</div>`:''}<h3 style="font-size:12px;margin:20px 0 8px">Texto da publicação</h3><div class="full-text">${esc(p.body_text)}</div><p style="margin-top:14px"><a class="btn btn-outline" href="${editUrl}" target="_blank" rel="noopener">Abrir / baixar Diário oficial ↗</a></p><div class="card-actions"><button data-review="${esc(p.id)}">Revisar classificação</button><span class="muted tiny">Classificação automática: ${p.ai_relevant?'relevante':'não relevante'}</span></div>`;
+    const {data:match,error:matchError}=await client.from('user_publication_matches').select('*').eq('publication_id',id).maybeSingle();
+    if(matchError){toast(matchError.message);return;}
+    const p=mergeUserMatch(data,match); const rel=isRelevant(p); const editUrl=safeUrl(p.editions?.source_pdf_url||p.source_url);
+    const extra=p.editions?.edition_type==='extra'?' · EDIÇÃO EXTRA':'';
+    $('modal-content').innerHTML=`<div class="section-kicker">${esc(p.kind||'PUBLICAÇÃO')} · ${esc(fmtDate(p.editions?.edition_date))}${extra}</div><h2 id="modal-title">${esc(p.title)}</h2><p class="muted tiny">${esc(pageText(p))} · ${esc(p.organization||'Órgão não identificado')}</p><div class="pub-meta">${rel?'<span class="tag green">Relevante para você</span>':'<span class="tag neutral">Demais atos</span>'}${publicationTags(p)}</div>${p.user_summary?`<div class="why-box"><strong>Resumo para seus temas</strong>${esc(p.user_summary)}</div>`:''}${p.user_justification?`<div class="why-box"><strong>Por que importa</strong>${esc(p.user_justification)}</div>`:''}<h3 style="font-size:12px;margin:20px 0 8px">Texto da publicação</h3><div class="full-text">${esc(p.body_text)}</div><p style="margin-top:14px"><a class="btn btn-outline" href="${editUrl}" target="_blank" rel="noopener">Abrir / baixar Diário Oficial ↗</a></p><div class="card-actions"><button data-review="${esc(p.id)}">Revisar classificação</button><span class="muted tiny">Classificação automática personalizada: ${isRelevant(p)?'relevante':'não relevante'}</span></div>`;
     $('publication-modal').classList.remove('hidden');
   }
   async function reviewPublication(id) {
-    const selected=window.prompt('Classificação final: digite R para relevante ou I para irrelevante. Deixe em branco para cancelar.');
+    const selected=window.prompt('Classificação final para sua conta: digite R para relevante ou I para irrelevante. Deixe em branco para cancelar.');
     if(!selected)return;
     const normalized=selected.trim().toUpperCase();
     if(!['R','I'].includes(normalized)){toast('Digite R ou I.');return;}
     const note=window.prompt('Observação da revisão (opcional):')||'';
-    const {error}=await client.from('publications').update({manual_relevance:normalized==='R',manual_note:note,reviewed_by:currentUser.id,reviewed_at:new Date().toISOString()}).eq('id',id);
+    const {data:publication,error:publicationError}=await client.from('publications').select('id,edition_id').eq('id',id).single();
+    if(publicationError){toast(publicationError.message);return;}
+    const {data:existingMatch,error:matchError}=await client.from('user_publication_matches').select('theme_signature,relevant,matched_themes,confidence,justification,summary').eq('publication_id',id).maybeSingle();
+    if(matchError){toast(matchError.message);return;}
+    const {error}=await client.from('user_publication_matches').upsert({
+      user_id:currentUser.id,
+      edition_id:publication.edition_id,
+      publication_id:id,
+      theme_signature:existingMatch?.theme_signature || currentAnalysis?.theme_signature || 'manual-review',
+      relevant:existingMatch?.relevant ?? false,
+      matched_themes:existingMatch?.matched_themes || [],
+      confidence:existingMatch?.confidence ?? null,
+      justification:existingMatch?.justification || null,
+      summary:existingMatch?.summary || null,
+      manual_relevance:normalized==='R',
+      manual_note:note,
+      reviewed_at:new Date().toISOString()
+    },{onConflict:'user_id,publication_id'});
     if(error){toast(`Falha ao salvar revisão: ${error.message}`);return;}
-    $('publication-modal').classList.add('hidden'); await loadDashboard(); toast('Revisão humana registrada.');
+    $('publication-modal').classList.add('hidden');
+    if(currentEdition?.id===publication.edition_id) await selectEdition(publication.edition_id);
+    else await loadPublications(false);
+    toast('Revisão particular da sua conta registrada.');
   }
   async function runResearch(event) {
     event.preventDefault();
@@ -224,16 +344,21 @@
       if(error)throw error;
       if(data.error)throw new Error(data.error);
       const sources=data.sources||[];
-      $('research-answer').innerHTML=`<h3>Resultado da pesquisa</h3><div class="answer-text">${esc(data.answer||'Não foi possível elaborar uma resposta.')}</div><div class="source-list"><h4>Fontes consultadas</h4>${sources.map(s=>`<a class="source-link" href="${safeUrl(s.sourceUrl)}" target="_blank" rel="noopener">[${s.ref}] ${esc(s.title)} · ${esc(fmtDate(s.editionDate))} · ${esc(s.pageStart?`p. ${s.pageStart}`:'página não identificada')} ↗</a>`).join('')}</div>`;
+      $('research-answer').innerHTML=`<h3>Resultado da pesquisa</h3><div class="answer-text">${esc(data.answer||'Não foi possível elaborar uma resposta.')}</div><div class="source-list"><h4>Fontes consultadas</h4>${sources.map(s=>`<a class="source-link" href="${safeUrl(s.sourceUrl)}" target="_blank" rel="noopener">[${s.ref}] ${esc(s.title)} · ${esc(fmtDate(s.editionDate))}${s.editionType==='extra'?' · EDIÇÃO EXTRA':''} · ${esc(s.pageStart?`p. ${s.pageStart}`:'página não identificada')} ↗</a>`).join('')}</div>`;
     }catch(e){$('research-answer').innerHTML=`<p class="error">Não foi possível concluir a pesquisa: ${esc(e.message||String(e))}</p>`;}
     finally{btn.disabled=false;btn.textContent='Pesquisar no acervo';}
   }
   function renderHistory(lastRun = latestRun) {
-    $('edition-history').innerHTML = editions.length ? editions.map(e=>`<div class="history-item"><strong>${esc(fmtDate(e.edition_date))}</strong><div><small>${esc(e.edition_label||'Parte II · Poder Legislativo')} · ${Number(e.publication_count||0)} atos · ${Number(e.relevant_count||0)} destaques</small></div><span class="status-pill ${e.status==='error'?'error':''}">${esc(e.status==='processed'?'Processada':e.status==='error'?'Erro':'Pendente')}</span><a href="${safeUrl(e.source_pdf_url||e.source_page_url)}" target="_blank" rel="noopener">Abrir Diário ↗</a></div>`).join('') : '<div class="empty-state">Nenhuma edição cadastrada.</div>';
+    const ordered = [...editions].sort((a,b)=>String(b.edition_date).localeCompare(String(a.edition_date)) || ((a.edition_type === 'extra' ? 1 : 0) - (b.edition_type === 'extra' ? 1 : 0)));
+    $('edition-history').innerHTML = ordered.length ? ordered.map(e=>`<div class="history-item"><strong>${esc(fmtDate(e.edition_date))}</strong><div><small>${e.edition_type==='extra'?'<span class="edition-extra-tag">EDIÇÃO EXTRA</span> · ':''}${esc(e.edition_label||'Parte II · Poder Legislativo')} · ${Number(e.publication_count||0)} atos</small></div><span class="status-pill ${e.status==='error'?'error':''}">${esc(e.status==='processed'?'Processada':e.status==='error'?'Erro':'Pendente')}</span><a href="${safeUrl(e.source_pdf_url||e.source_page_url)}" target="_blank" rel="noopener">Abrir Diário ↗</a></div>`).join('') : '<div class="empty-state">Nenhuma edição cadastrada.</div>';
     const run=lastRun;
-    $('run-status').textContent=run?`Última execução: ${fmtDate(run.started_at,{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'})} · ${run.status} · ${run.message||''}`:'Ainda não há execuções registradas.';
+    $('run-status').textContent=run?`Última execução: ${fmtDate(run.started_at,{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'})} · ${run.status} · ${run.edition_type==='extra'?'verificação de edição extra · ':''}${run.message||''}`:'Ainda não há execuções registradas.';
     const date=$('publication-date');
-    if(date && date.options.length<=1) date.innerHTML='<option value="all">Todas as edições</option>'+editions.map(e=>`<option value="${esc(e.id)}">${esc(fmtDate(e.edition_date))}</option>`).join('');
+    if(date) {
+      const current = date.value || 'all';
+      date.innerHTML='<option value="all">Todas as edições</option>'+ordered.map(e=>`<option value="${esc(e.id)}">${esc(fmtDate(e.edition_date))}${e.edition_type==='extra'?` — ${esc((e.edition_label||'').match(/EDIÇÃO EXTRA\s+\d+/i)?.[0]||'EDIÇÃO EXTRA')}`:''}</option>`).join('');
+      date.value = [...date.options].some(o=>o.value===current) ? current : 'all';
+    }
   }
 
   document.addEventListener('click', async (event) => {

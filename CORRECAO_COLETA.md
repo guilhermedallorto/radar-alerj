@@ -1,3 +1,5 @@
+> **Nota histórica:** documento referente à correção anterior do coletor. Para a arquitetura atual, a implantação e a migração de banco, siga `README.md`, `PASSO_A_PASSO.md` e `IMPLEMENTACAO_TEMAS_PERSONALIZADOS_E_EDICOES_EXTRAS.md`.
+
 # Correção da coleta da Parte II — 13/11/2026
 
 ## O que foi corrigido

@@ -55,6 +55,7 @@
       <section id="view-daily" class="view">
         <div class="section-kicker">ACOMPANHAMENTO DAS EDIÇÕES</div>
         <div class="edition-tabs" id="edition-tabs"><div class="skeleton">Carregando edições...</div></div>
+        <div class="edition-check-status" id="edition-check-status" aria-live="polite"></div>
         <div class="daily-heading">
           <div><div class="eyebrow" id="edition-weekday">EDIÇÃO SELECIONADA</div><h2 id="edition-title">Leitura diária</h2><p id="edition-subtitle" class="muted"></p></div>
           <a id="edition-source" class="btn btn-outline" href="#" target="_blank" rel="noopener">Abrir Diário Oficial ↗</a>
@@ -72,12 +73,12 @@
 
       <section id="view-publications" class="view hidden">
         <div class="page-heading"><div><div class="section-kicker">ACERVO INTEGRAL · TODAS AS PUBLICAÇÕES</div><h2>Publicações</h2><p class="muted">O acervo inclui todos os atos identificados na Parte II, e não apenas os classificados como relevantes.</p></div></div>
-        <div class="filter-bar"><input id="publication-query" type="search" placeholder="Pesquisar no texto dos atos..." /><select id="publication-filter"><option value="all">Todas as publicações</option><option value="relevant">Relevantes para os temas</option><option value="other">Demais publicações</option></select><select id="publication-date"><option value="all">Todas as edições</option></select><button id="publication-search-btn" class="btn btn-dark">Filtrar</button></div>
+        <div class="filter-bar"><input id="publication-query" type="search" placeholder="Pesquisar no texto dos atos..." /><select id="publication-filter"><option value="all">Todas as publicações</option><option value="relevant">Destaques dos meus temas</option><option value="other">Analisadas e não relevantes</option></select><select id="publication-date"><option value="all">Todas as edições</option></select><button id="publication-search-btn" class="btn btn-dark">Filtrar</button></div>
         <div id="publication-results" class="publication-list"></div><div class="load-more-wrap"><button id="pub-load-more" class="btn btn-outline hidden">Carregar mais publicações</button></div>
       </section>
 
       <section id="view-themes" class="view hidden">
-        <div class="page-heading"><div><div class="section-kicker">PERSONALIZAÇÃO DO MONITORAMENTO</div><h2>Temas monitorados</h2><p class="muted">A IA considera contexto e critérios substantivos. Palavras-chave funcionam como pistas, não como único critério.</p></div></div>
+        <div class="page-heading"><div><div class="section-kicker">PERSONALIZAÇÃO DO MONITORAMENTO</div><h2>Temas monitorados</h2><p class="muted">Os temas cadastrados aqui são particulares da sua conta. A IA considera contexto e critérios substantivos; palavras-chave funcionam como pistas, não como único critério.</p></div></div>
         <div class="theme-editor">
           <form id="theme-form">
             <input id="theme-id" type="hidden" />

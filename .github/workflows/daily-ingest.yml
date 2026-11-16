@@ -1,20 +1,37 @@
-name: Radar ALERJ — coleta diária
+name: Radar ALERJ — coleta e verificação de edições
 
 on:
   schedule:
-    # 09h05 no fuso de Brasília (America/Sao_Paulo), todos os dias.
-    # O minuto 05 evita o pico de agendamentos no início da hora.
+    # Coleta da edição regular, todos os dias às 9h05 de Brasília.
     - cron: '5 9 * * *'
       timezone: 'America/Sao_Paulo'
+    # Segunda checagem diária para identificar uma eventual edição extra.
+    - cron: '0 22 * * *'
+      timezone: 'America/Sao_Paulo'
   workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: 'Tipo de edição a verificar manualmente'
+        required: true
+        type: choice
+        options:
+          - regular
+          - extra
+          - both
+        default: both
 
 permissions:
   contents: read
 
+# Impede sobreposição entre verificações agendadas e execuções manuais.
+concurrency:
+  group: radar-alerj-ingest
+  cancel-in-progress: false
+
 jobs:
   collect-and-process:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Baixar código
         uses: actions/checkout@v7
@@ -43,4 +60,5 @@ jobs:
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          EDITION_SCAN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode || (github.event.schedule == '0 22 * * *' && 'extra' || 'regular') }}
         run: python worker/ingest.py

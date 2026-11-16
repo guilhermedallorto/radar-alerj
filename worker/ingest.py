@@ -94,10 +94,19 @@ def extract_date(soup: BeautifulSoup, selection_url: str) -> date:
     raise RuntimeError("Não foi possível identificar a data da última edição no portal da IOERJ.")
 
 
-def find_part_ii_link(html: str, base_url: str) -> str:
-    """Localiza o caderno mesmo quando o portal muda a marcação do link."""
-    soup = BeautifulSoup(html, "html.parser")
+def find_part_ii_links(
+    html: str,
+    base_url: str,
+    edition_type: str = "regular",
+    *,
+    required: bool = True,
+) -> list[str]:
+    """Localiza todos os links da Parte II regular ou identificados como EDIÇÃO EXTRA."""
+    if edition_type not in {"regular", "extra"}:
+        raise ValueError(f"Tipo de edição inválido: {edition_type}")
 
+    soup = BeautifulSoup(html, "html.parser")
+    found: list[str] = []
     for element in soup.find_all(["a", "button", "area"]):
         label_parts = [
             element.get_text(" ", strip=True),
@@ -109,41 +118,62 @@ def find_part_ii_link(html: str, base_url: str) -> str:
         label = norm(" ".join(str(x) for x in label_parts if x))
         if "parte ii" not in label:
             continue
-        if "legislativo" not in label and "poder legislativo" not in label:
-            # O portal também pode abreviar o rótulo visual, mas manter o destino
-            # explícito no href ou no onclick.
+        if "legislativo" not in label:
             destination_hint = norm(str(element.get("href", "")) + " " + str(element.get("onclick", "")))
             if "legislativo" not in destination_hint and "parte_ii" not in destination_hint and "parteii" not in destination_hint:
                 continue
 
-        href = element.get("href") or element.get("data-href") or element.get("data-url")
-        if href and not href.strip().lower().startswith(("javascript:", "#")):
-            return urljoin(base_url, href.strip())
+        is_extra = "edicao extra" in label
+        if edition_type == "extra" and not is_extra:
+            continue
+        if edition_type == "regular" and is_extra:
+            continue
 
-        # Alguns templates implementam os botões por JavaScript.
-        onclick = str(element.get("onclick", ""))
-        match = re.search(r"(?:location(?:\.href)?|open)\s*\(?\s*['\"]([^'\"]+)['\"]", onclick, re.I)
-        if match:
-            return urljoin(base_url, match.group(1))
-        match = re.search(r"['\"]([^'\"]*(?:mostra_edicao|conteudoonline)[^'\"]*)['\"]", onclick, re.I)
-        if match:
-            return urljoin(base_url, match.group(1))
+        destination = element.get("href") or element.get("data-href") or element.get("data-url")
+        if destination and not str(destination).strip().lower().startswith(("javascript:", "#")):
+            target = urljoin(base_url, str(destination).strip())
+        else:
+            onclick = str(element.get("onclick", ""))
+            match = re.search(r"(?:location(?:\.href)?|open)\s*\(?\s*['\"]([^'\"]+)['\"]", onclick, re.I)
+            if not match:
+                match = re.search(r"['\"]([^'\"]*(?:mostra_edicao|conteudoonline)[^'\"]*)['\"]", onclick, re.I)
+            if not match:
+                continue
+            target = urljoin(base_url, match.group(1))
+        if target not in found:
+            found.append(target)
 
-    # Diagnóstico explícito: ajuda a identificar alterações ou respostas
-    # intermediárias (bloqueio, página de erro ou HTML diferente) no portal.
+    if found:
+        return found
+    if not required:
+        return []
+
     visible_links = []
-    for a in soup.find_all("a", href=True)[:35]:
+    for a in soup.find_all("a", href=True)[:45]:
         text = re.sub(r"\s+", " ", a.get_text(" ", strip=True))[:90]
         visible_links.append(f"{text!r} -> {a.get('href', '')[:180]}")
-    page_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:500]
+    page_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:600]
     diagnostic = (
         f"URL consultada: {base_url}. Título HTML: {soup.title.get_text(' ', strip=True) if soup.title else '(sem título)'}. "
         f"Texto inicial: {page_text!r}. Links encontrados: {' | '.join(visible_links) or '(nenhum)'}"
     )
+    wanted = "Parte II — Poder Legislativo · EDIÇÃO EXTRA" if edition_type == "extra" else "Parte II — Poder Legislativo (regular)"
     raise RuntimeError(
-        "A página da edição foi localizada, mas o link da Parte II (Poder Legislativo) não foi encontrado. "
-        + diagnostic
+        f"A página da edição foi localizada, mas o link da {wanted} não foi encontrado. " + diagnostic
     )
+
+
+def find_part_ii_link(
+    html: str,
+    base_url: str,
+    edition_type: str = "regular",
+    *,
+    required: bool = True,
+) -> str | None:
+    """Compatibilidade: retorna o primeiro link de uma categoria."""
+    links = find_part_ii_links(html, base_url, edition_type, required=required)
+    return links[0] if links else None
+
 
 
 def find_edition_continuation(response: requests.Response) -> str | None:
@@ -201,8 +231,8 @@ def date_from_calendar_link(href: str) -> date | None:
     return None
 
 
-def discover_latest_from_calendar() -> tuple[date, str]:
-    """Entra pelo calendário de datas e seleciona a edição mais recente disponível."""
+def discover_calendar_selection(target_date: date | None = None) -> tuple[date, str] | None:
+    """Localiza no calendário a data solicitada ou, sem data, a edição mais recente."""
     calendar = http_get(SELECT_DATE)
     soup = BeautifulSoup(calendar.text, "html.parser")
     today_local = datetime.now(ZoneInfo(TZ)).date()
@@ -213,15 +243,16 @@ def discover_latest_from_calendar() -> tuple[date, str]:
         if not href:
             continue
         target = urljoin(calendar.url, href)
-        path = urlparse(target).path.lower()
-        if not path.endswith("do_seleciona_edicao.php"):
+        if not urlparse(target).path.lower().endswith("do_seleciona_edicao.php"):
             continue
         edition_day = date_from_calendar_link(target)
         if edition_day:
             candidates.append((edition_day, target))
 
-    # O calendário pode listar vários anos. Escolhemos a maior data que não
-    # ultrapasse a data local de hoje, para não selecionar um dia futuro.
+    if target_date is not None:
+        exact = [(day, url) for day, url in candidates if day == target_date]
+        return exact[0] if exact else None
+
     eligible = [(day, url) for day, url in candidates if day <= today_local]
     if not eligible:
         raise RuntimeError(
@@ -231,60 +262,86 @@ def discover_latest_from_calendar() -> tuple[date, str]:
     return max(eligible, key=lambda item: item[0])
 
 
-def discover_latest() -> dict[str, Any]:
-    # Caminho principal: calendário de datas -> página da edição -> link
-    # explicitamente rotulado Parte II (Poder Legislativo).
-    try:
-        calendar_date, selection_url = discover_latest_from_calendar()
-    except Exception as calendar_exc:
-        # Só usa o caminho legado se a própria consulta ao calendário falhar.
-        # Se a página de edição existir, mas não trouxer o link da Parte II ou
-        # apresentar data divergente, a coleta deve parar em vez de tentar
-        # adivinhar outro arquivo.
-        print(f"Falha ao localizar uma data pelo calendário ({calendar_exc}); tentando o caminho legado.")
-        home = http_get(PORTAL)
-        home_soup = BeautifulSoup(home.text, "html.parser")
-        last_url = None
-        for a in home_soup.find_all("a", href=True):
-            if "ultima edicao" in norm(a.get_text(" ", strip=True)):
-                last_url = urljoin(home.url, a["href"])
-                break
-        latest = http_get(last_url or LAST_EDITION)
-        visited = {latest.url}
-        for _ in range(3):
-            continuation = find_edition_continuation(latest)
-            if not continuation or continuation in visited:
-                break
-            visited.add(continuation)
-            latest = http_get(continuation)
-        else:
-            raise RuntimeError("O portal da IOERJ apresentou redirecionamentos intermediários em excesso.")
-        selection_url = latest.url
-        latest_soup = BeautifulSoup(latest.text, "html.parser")
-        part_url = find_part_ii_link(latest.text, selection_url)
-        edition_date = extract_date(latest_soup, selection_url)
+def discover_latest_from_calendar() -> tuple[date, str]:
+    result = discover_calendar_selection()
+    if result is None:
+        raise RuntimeError("Não foi possível localizar uma edição no calendário da IOERJ.")
+    return result
+
+
+def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
+    """Localiza uma edição regular ou todas as extras da data local corrente."""
+    if edition_type not in {"regular", "extra"}:
+        raise ValueError("edition_type deve ser 'regular' ou 'extra'.")
+
+    today_local = datetime.now(ZoneInfo(TZ)).date()
+    if edition_type == "extra":
+        calendar_result = discover_calendar_selection(today_local)
+        if calendar_result is None:
+            print(f"O calendário da IOERJ ainda não lista {today_local.isoformat()}; nenhuma edição extra a conferir.")
+            return []
     else:
-        latest = http_get(selection_url)
-        latest_soup = BeautifulSoup(latest.text, "html.parser")
-        # A ausência do link correto é erro fatal; não substitui a Parte II
-        # por outro PDF localizado na página ou em links relacionados.
-        part_url = find_part_ii_link(latest.text, latest.url)
-        edition_date = extract_date(latest_soup, latest.url)
-        if edition_date != calendar_date:
-            raise RuntimeError(
-                "A data da página da edição não corresponde à data codificada no calendário: "
-                f"calendário={calendar_date.isoformat()}; página={edition_date.isoformat()}. "
-                "A coleta foi interrompida para evitar selecionar outra edição."
-            )
+        calendar_result = discover_latest_from_calendar()
+
+    calendar_date, selection_url = calendar_result
+    latest = http_get(selection_url)
+    latest_soup = BeautifulSoup(latest.text, "html.parser")
+    page_url = latest.url
+    edition_date = extract_date(latest_soup, page_url)
+    if edition_date != calendar_date:
+        raise RuntimeError(
+            "A data da página da edição não corresponde à data codificada no calendário: "
+            f"calendário={calendar_date.isoformat()}; página={edition_date.isoformat()}. "
+            "A coleta foi interrompida para evitar selecionar outra edição."
+        )
+    if edition_type == "extra" and edition_date != today_local:
+        raise RuntimeError(
+            f"A checagem de edição extra deveria ser de hoje ({today_local.isoformat()}), "
+            f"mas o portal retornou {edition_date.isoformat()}."
+        )
+
+    part_urls = find_part_ii_links(
+        latest.text,
+        page_url,
+        edition_type=edition_type,
+        required=(edition_type == "regular"),
+    )
+    if not part_urls:
+        print(f"A página de {edition_date.isoformat()} não apresenta link 'Parte II — Poder Legislativo — EDIÇÃO EXTRA'.")
+        return []
+    if edition_type == "regular" and len(part_urls) != 1:
+        raise RuntimeError(
+            f"A página de {edition_date.isoformat()} apresentou {len(part_urls)} links de Parte II regular; "
+            "a coleta foi interrompida para evitar escolher um caderno ambíguo."
+        )
 
     label_match = re.search(r"Ano\s+([IVXLCDM]+).*?N[º°o]\s*(\d+)", latest_soup.get_text(" ", strip=True), re.I)
-    edition_label = f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}" if label_match else ""
-    return {
-        "edition_date": edition_date.isoformat(),
-        "edition_label": edition_label,
-        "selection_url": selection_url,
-        "part_ii_url": part_url,
-    }
+    base_label = f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}" if label_match else "Parte II · Poder Legislativo"
+    total = len(part_urls)
+    results = []
+    for index, part_url in enumerate(part_urls, start=1):
+        if edition_type == "extra":
+            ordinal = f" {index}" if total > 1 else ""
+            edition_label = f"{base_label} · EDIÇÃO EXTRA{ordinal}"
+        else:
+            edition_label = base_label
+        results.append({
+            "edition_date": edition_date.isoformat(),
+            "edition_type": edition_type,
+            "edition_label": edition_label,
+            "extra_index": index if edition_type == "extra" else None,
+            "extra_total": total if edition_type == "extra" else None,
+            "selection_url": page_url,
+            "part_ii_url": part_url,
+        })
+    return results
+
+
+def discover_edition(edition_type: str = "regular") -> dict[str, Any] | None:
+    """Compatibilidade com chamadas antigas; retorna a primeira edição encontrada."""
+    editions = discover_editions(edition_type)
+    return editions[0] if editions else None
+
 
 
 PDFJS_EXTRACT_JS = r"""
@@ -655,13 +712,34 @@ def db_delete(table: str, params: dict[str, str]) -> None:
         raise RuntimeError(f"Supabase DELETE {table} falhou ({r.status_code}): {r.text[:1500]}")
 
 
-def log_run(status: str, message: str, edition_date: str | None = None, total: int = 0, relevant: int = 0, run_id: str | None = None) -> None:
+def log_run(
+    status: str,
+    message: str,
+    edition_date: str | None = None,
+    edition_type: str | None = None,
+    total: int = 0,
+    relevant: int = 0,
+    run_id: str | None = None,
+    edition_key: str | None = None,
+) -> None:
     finished = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "finished_at": finished,
+        "status": status,
+        "message": message,
+        "publications_found": total,
+        "publications_relevant": relevant,
+    }
+    if edition_date is not None:
+        payload["edition_date"] = edition_date
+    if edition_type is not None:
+        payload["edition_type"] = edition_type
+    if edition_key is not None:
+        payload["edition_key"] = edition_key
     if run_id:
-        db_patch("ingestion_runs", {"id": f"eq.{run_id}"}, {"finished_at": finished, "status": status, "message": message, "publications_found": total, "publications_relevant": relevant})
+        db_patch("ingestion_runs", {"id": f"eq.{run_id}"}, payload)
     else:
-        db_post("ingestion_runs", {"status": status, "edition_date": edition_date, "message": message, "finished_at": finished, "publications_found": total, "publications_relevant": relevant})
-
+        db_post("ingestion_runs", {"status": status, **payload})
 
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
     """Solicita JSON ao Gemini com backoff para 429/503 e falhas de rede/timeout."""
@@ -747,45 +825,38 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
         raise RuntimeError(f"O Gemini não devolveu JSON válido: {output[:800]}") from exc
 
 
-def load_themes() -> list[dict[str, Any]]:
-    rows = db_get("themes", {"select": "id,name,description,keywords,include_criteria,exclude_criteria,priority", "active": "eq.true", "order": "priority.asc"})
-    return rows or []
+def classify_chunk(chunk: dict[str, Any], edition_date: str) -> list[dict[str, Any]]:
+    """Segmenta o conteúdo do caderno em publicações, sem classificar temas globais."""
+    prompt = f"""Você é um analista documental responsável por segmentar uma edição do Diário Oficial do Estado do Rio de Janeiro, Parte II — Poder Legislativo.
 
-
-def classify_chunk(chunk: dict[str, Any], edition_date: str, themes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    theme_info = themes if themes else "Nenhum tema ativo. Identifique e preserve todos os atos, mas relevant=false, matched_themes=[] e summary vazio."
-    prompt = f"""Você é um analista documental do gabinete parlamentar. Analise o texto da edição do Diário Oficial do Estado do Rio de Janeiro, Parte II — Poder Legislativo.
-
-TAREFA: segmentar o texto em publicações oficiais individuais. Não descarte atos por parecerem pouco relevantes. A abrangência é TODAS as publicações do caderno.
+TAREFA: identificar e separar TODAS as publicações oficiais individuais presentes no trecho. Esta etapa é compartilhada entre usuários: NÃO avalie relevância temática, não selecione assuntos e não gere destaques para um gabinete específico.
 
 REGRAS:
-- Preserve o conteúdo material e os dados. Não invente títulos, órgãos, pessoas, números, municípios, valores ou páginas.
+- Não descarte publicações por parecerem pouco relevantes.
+- Preserve o conteúdo material, a sequência e os dados do documento.
+- Não invente títulos, órgãos, pessoas, números, municípios, valores ou páginas.
 - Agrupe itens somente quando a própria publicação indicar uma relação/listagem conjunta.
-- Considere palavras-chave como pistas, mas classifique pelos critérios substantivos de cada tema.
-- Uma publicação só é relevante se corresponder claramente a pelo menos um tema ativo. Use matched_themes com os nomes exatos dos temas.
-- Para itens relevantes, escreva resumo objetivo de 2 a 4 frases e justification específica sobre a relação com o tema. Para itens não relevantes, summary deve ser vazio.
-- O texto do ato deve ser fiel ao documento e suficiente para consulta posterior. Não faça paráfrase no campo text.
-- Quando não souber, use null ou array vazio. Páginas são a numeração física do PDF.
+- O texto em `text` deve ser fiel ao documento, sem paráfrase, e suficiente para consulta posterior.
+- Quando não souber, use null ou array vazio.
+- `page_start` e `page_end` são números das páginas físicas do PDF.
+- Os campos `relevant`, `matched_themes`, `confidence`, `justification` e `summary` devem ser, respectivamente, false, [], null, null e null. A análise temática será feita separadamente para cada usuário autenticado.
 
 DATA DA EDIÇÃO: {edition_date}
-TEMAS ATIVOS (nome, descrição, palavras-chave, inclusão, exclusão e prioridade):
-{json.dumps(theme_info, ensure_ascii=False)}
 
-RETORNE SOMENTE JSON no formato {{"items":[{{"page_start":1,"page_end":1,"type":"...","title":"...","text":"...","organization":"...","people":[],"municipalities":[],"amounts":[],"relevant":false,"matched_themes":[],"confidence":0.0,"justification":"...","summary":"..."}}]}}
+RETORNE SOMENTE JSON no formato {{"items":[{{"page_start":1,"page_end":1,"type":"...","title":"...","text":"...","organization":"...","people":[],"municipalities":[],"amounts":[],"relevant":false,"matched_themes":[],"confidence":null,"justification":null,"summary":null}}]}}
 
 TEXTO:
 {chunk['text']}"""
     result = gemini_json(prompt, 9000)
     if isinstance(result, list):
-        # Formato observado na execução: array de publicações na raiz.
         items = result
         print("Aviso: Gemini retornou uma lista na raiz; formato normalizado para items.")
     elif isinstance(result, dict):
         items = result.get("items", [])
     else:
-        raise RuntimeError("A classificação do Gemini não retornou um objeto nem uma lista.")
+        raise RuntimeError("A segmentação do Gemini não retornou um objeto nem uma lista.")
     if not isinstance(items, list):
-        raise RuntimeError("A classificação do Gemini não contém uma lista válida em 'items'.")
+        raise RuntimeError("A segmentação do Gemini não contém uma lista válida em 'items'.")
     for item in items:
         if not isinstance(item, dict):
             raise RuntimeError("A lista de publicações do Gemini contém um item que não é objeto JSON.")
@@ -793,6 +864,11 @@ TEXTO:
             item["page_start"] = chunk.get("start_page")
         if item.get("page_end") is None:
             item["page_end"] = chunk.get("end_page")
+        item["relevant"] = False
+        item["matched_themes"] = []
+        item["confidence"] = None
+        item["justification"] = None
+        item["summary"] = None
     return items
 
 
@@ -800,22 +876,33 @@ def clean_str(value: Any, default: str = "") -> str:
     return str(value if value is not None else default).strip()
 
 
-def publication_key(edition_date: str, item: dict[str, Any]) -> str:
+def publication_key(
+    edition_date: str,
+    item: dict[str, Any],
+    edition_type: str = "regular",
+    edition_key: str | None = None,
+) -> str:
     body = clean_str(item.get("text"))
     title = norm(item.get("title"))
-    return sha256(f"{edition_date}|{title}|{norm(body[:1200])}")
+    # Mantém as chaves antigas das edições regulares. Cada extra usa um
+    # namespace derivado do hash do PDF, permitindo múltiplas extras no mesmo dia.
+    if edition_type == "regular":
+        prefix = edition_date
+    else:
+        prefix = f"{edition_date}|{edition_key or 'extra'}"
+    return sha256(f"{prefix}|{title}|{norm(body[:1200])}")
 
 
-def daily_summary(edition_date: str, publications: list[dict[str, Any]]) -> str:
+def daily_summary(edition_date: str, publications: list[dict[str, Any]], edition_type: str = "regular") -> str:
     summaries = []
     for p in publications[:130]:
         excerpt = re.sub(r"\s+", " ", clean_str(p.get("text")))[:360]
         summaries.append({
             "type": p.get("type"), "title": p.get("title"), "excerpt": excerpt,
-            "themes": p.get("matched_themes", []), "relevant": bool(p.get("relevant")),
         })
-    prompt = f"""Redija uma síntese diária para gabinete parlamentar sobre a edição da Parte II do Diário Oficial do Estado do Rio de Janeiro em {edition_date}.
-Use somente as publicações listadas. Seja factual, conciso e institucional. Informe os destaques temáticos encontrados, os principais atos e lacunas relevantes. Não invente fatos ou contagens. Quando nenhum tema do gabinete aparecer, diga isso claramente. Produza um parágrafo entre 100 e 180 palavras. Retorne JSON {{\"summary\":\"...\"}}.
+    kind = "edição extra" if edition_type == "extra" else "edição regular"
+    prompt = f"""Redija uma síntese factual da {kind} da Parte II — Poder Legislativo do Diário Oficial do Estado do Rio de Janeiro em {edition_date}.
+Use somente as publicações listadas. Descreva os principais assuntos e tipos de atos encontrados, sem presumir temas de interesse de um usuário específico. Seja conciso, institucional e não invente fatos ou contagens. Produza um parágrafo entre 90 e 150 palavras. Retorne JSON {{\"summary\":\"...\"}}.
 
 PUBLICAÇÕES:
 {json.dumps(summaries, ensure_ascii=False)}"""
@@ -823,66 +910,406 @@ PUBLICAÇÕES:
     if isinstance(result, dict) and clean_str(result.get("summary")):
         return clean_str(result.get("summary"))
     return (
-        f"A edição de {edition_date} foi processada e contém {len(publications)} publicações. "
-        "A síntese automática não foi disponibilizada nesta execução; consulte os registros individuais."
+        f"A {kind} de {edition_date} foi processada e contém {len(publications)} publicações. "
+        "Consulte os registros individuais para examinar os atos publicados."
     )
 
+def db_get_all(table: str, params: dict[str, str], page_size: int = 1000) -> list[dict[str, Any]]:
+    """Lê todas as páginas de uma tabela REST sem depender do limite padrão do Supabase."""
+    collected: list[dict[str, Any]] = []
+    for offset in range(0, 100_000, page_size):
+        page_params = {**params, "limit": str(page_size), "offset": str(offset)}
+        page = db_get(table, page_params) or []
+        if not isinstance(page, list):
+            raise RuntimeError(f"A consulta de {table} não retornou uma lista.")
+        collected.extend(page)
+        if len(page) < page_size:
+            return collected
+    raise RuntimeError(f"A consulta de {table} excedeu o limite de 100.000 registros.")
 
-def edition_exists(edition_date: str, pdf_hash: str) -> dict[str, Any] | None:
-    found = db_get("editions", {"select": "id,edition_date,pdf_sha256,status", "edition_date": f"eq.{edition_date}", "limit": "1"})
-    if not found:
-        return None
-    row = found[0]
-    if row.get("pdf_sha256") == pdf_hash and row.get("status") == "processed":
-        return row
-    return row
+
+def user_theme_signature(themes: list[dict[str, Any]], publications: list[dict[str, Any]]) -> str:
+    """Replica a assinatura usada por analyze-user-themes para permitir cache compartilhado."""
+    # Ordenação por UUID torna a assinatura idêntica à calculada pela Edge
+    # Function, independentemente da collation do banco ou da ordem do REST.
+    active_themes = sorted(
+        [theme for theme in themes if theme.get("active")],
+        key=lambda t: clean_str(t.get("id")),
+    )
+    ordered_publications = sorted(publications, key=lambda p: clean_str(p.get("id")))
+    signature_source = {
+        "themes": [
+            {
+                "id": t.get("id"),
+                "name": t.get("name"),
+                "description": t.get("description") or "",
+                "keywords": t.get("keywords") or [],
+                "include_criteria": t.get("include_criteria") or "",
+                "exclude_criteria": t.get("exclude_criteria") or "",
+                "priority": int(t.get("priority") or 3),
+                "updated_at": t.get("updated_at"),
+            }
+            for t in active_themes
+        ],
+        "publications": [[p.get("id"), p.get("updated_at") or ""] for p in ordered_publications],
+    }
+    serialized = json.dumps(signature_source, ensure_ascii=False, separators=(",", ":"))
+    return sha256(serialized)
 
 
-def process() -> None:
-    run_rows = db_post("ingestion_runs", {"status": "running", "message": "Iniciando localização da última edição."})
+def analyze_edition_for_users(edition_id: str, edition_date: str, edition_label: str) -> dict[str, int]:
+    """Pré-calcula os destaques de uma edição extra separadamente para cada usuário com temas."""
+    themes_all = db_get_all("themes", {
+        "select": "id,user_id,name,description,keywords,include_criteria,exclude_criteria,priority,active,updated_at",
+        "order": "user_id.asc,priority.asc,name.asc,id.asc",
+    })
+    themes_by_user: dict[str, list[dict[str, Any]]] = {}
+    for theme in themes_all:
+        user_id = clean_str(theme.get("user_id"))
+        if user_id:
+            themes_by_user.setdefault(user_id, []).append(theme)
+
+    if not themes_by_user:
+        print("Análise temática noturna: não há usuários com temas cadastrados; a análise será feita quando uma conta configurar temas.")
+        return {"users": 0, "processed": 0, "failed": 0}
+
+    publications = db_get_all("publications", {
+        "select": "id,edition_id,page_start,page_end,kind,title,body_text,organization,people,municipalities,amounts,updated_at",
+        "edition_id": f"eq.{edition_id}",
+        "order": "page_start.asc,id.asc",
+    })
+    results = {"users": len(themes_by_user), "processed": 0, "failed": 0}
+
+    for user_number, (user_id, user_themes_all) in enumerate(themes_by_user.items(), start=1):
+        analysis_started = False
+        theme_signature = ""
+        try:
+            active_themes = sorted(
+                [theme for theme in user_themes_all if theme.get("active")],
+                key=lambda t: (int(t.get("priority") or 3), clean_str(t.get("name")), clean_str(t.get("id"))),
+            )
+            theme_signature = user_theme_signature(user_themes_all, publications)
+            prior_rows = db_get("user_edition_analyses", {
+                "select": "id,status,theme_signature,publication_count,relevant_count,summary",
+                "user_id": f"eq.{user_id}",
+                "edition_id": f"eq.{edition_id}",
+                "limit": "1",
+            })
+            prior = prior_rows[0] if prior_rows else None
+            if (
+                prior and prior.get("status") == "processed"
+                and prior.get("theme_signature") == theme_signature
+                and int(prior.get("publication_count") or 0) == len(publications)
+            ):
+                print(f"Análise personalizada já atualizada: usuário {user_id[:8]}… ({len(publications)} publicações).")
+                results["processed"] += 1
+                continue
+
+            analysis_payload = {
+                "user_id": user_id,
+                "edition_id": edition_id,
+                "theme_signature": theme_signature,
+                "status": "processing",
+                "publication_count": len(publications),
+                "relevant_count": 0,
+                "error": None,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "finished_at": None,
+            }
+            db_post("user_edition_analyses", analysis_payload, on_conflict="user_id,edition_id")
+            analysis_started = True
+
+            previous_rows = db_get_all("user_publication_matches", {
+                "select": "publication_id,manual_relevance,manual_note,reviewed_at,relevant,matched_themes,confidence,justification,summary",
+                "user_id": f"eq.{user_id}",
+                "edition_id": f"eq.{edition_id}",
+            })
+            previous_by_publication = {row.get("publication_id"): row for row in previous_rows}
+
+            if not active_themes:
+                db_patch("user_publication_matches", {
+                    "user_id": f"eq.{user_id}",
+                    "edition_id": f"eq.{edition_id}",
+                    "manual_relevance": "is.null",
+                }, {
+                    "theme_signature": theme_signature,
+                    "relevant": False,
+                    "matched_themes": [],
+                    "confidence": None,
+                    "justification": None,
+                    "summary": None,
+                })
+                summary = "Nenhum tema ativo está configurado para este usuário. Cadastre ou ative temas para receber destaques personalizados nas próximas edições."
+                db_patch("user_edition_analyses", {
+                    "user_id": f"eq.{user_id}",
+                    "edition_id": f"eq.{edition_id}",
+                }, {
+                    "status": "processed",
+                    "summary": summary,
+                    "publication_count": len(publications),
+                    "relevant_count": 0,
+                    "error": None,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                results["processed"] += 1
+                continue
+
+            themes_for_prompt = [
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name"),
+                    "description": t.get("description") or "",
+                    "keywords": t.get("keywords") or [],
+                    "include_criteria": t.get("include_criteria") or "",
+                    "exclude_criteria": t.get("exclude_criteria") or "",
+                    "priority": int(t.get("priority") or 3),
+                }
+                for t in active_themes
+            ]
+            allowed_names = {t["name"] for t in themes_for_prompt}
+            classified_rows: list[dict[str, Any]] = []
+            batch_size = 10
+            for offset in range(0, len(publications), batch_size):
+                batch = publications[offset:offset + batch_size]
+                compact = [
+                    {
+                        "publication_id": p.get("id"),
+                        "type": p.get("kind"),
+                        "title": p.get("title"),
+                        "organization": p.get("organization"),
+                        "page_start": p.get("page_start"),
+                        "page_end": p.get("page_end"),
+                        "text": re.sub(r"\s+", " ", clean_str(p.get("body_text")))[:2600],
+                    }
+                    for p in batch
+                ]
+                prompt = f"""Você é um analista documental de um gabinete parlamentar. Classifique cada publicação exclusivamente em relação aos temas particulares deste usuário.
+
+REGRAS OBRIGATÓRIAS:
+- Avalie o conteúdo substantivo, não apenas coincidências de palavras.
+- Considere palavras-chave como pistas; aplique os critérios de inclusão e exclusão.
+- Uma publicação é relevante somente quando houver relação clara com pelo menos um tema ativo.
+- Use os nomes exatos dos temas fornecidos em matched_themes.
+- Não invente relações, fatos, pessoas, valores, municípios ou consequências.
+- Para cada publicação, devolva exatamente uma classificação e preserve o publication_id sem alteração.
+- Para itens irrelevantes, use matched_themes=[], justification="" e summary="".
+- Para itens relevantes, dê uma justificativa específica e um resumo factual de 2 a 4 frases.
+- Não omita nenhuma publicação do lote.
+
+TEMAS PARTICULARES DO USUÁRIO:
+{json.dumps(themes_for_prompt, ensure_ascii=False)}
+
+PUBLICAÇÕES DO LOTE:
+{json.dumps(compact, ensure_ascii=False)}
+
+Responda somente JSON no formato {{"items":[{{"publication_id":"UUID","relevant":true,"matched_themes":["Tema exato"],"confidence":0.0,"justification":"...","summary":"..."}}]}}."""
+                parsed = gemini_json(prompt, 6000)
+                if isinstance(parsed, list):
+                    items = parsed
+                elif isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+                    items = parsed["items"]
+                else:
+                    raise RuntimeError("O Gemini não retornou uma lista JSON de classificações.")
+
+                by_id: dict[str, dict[str, Any]] = {}
+                valid_ids = {clean_str(p.get("id")) for p in batch}
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("O Gemini retornou item de classificação em formato inválido.")
+                    publication_id = clean_str(item.get("publication_id"))
+                    if not publication_id or publication_id not in valid_ids or publication_id in by_id:
+                        raise RuntimeError("O Gemini retornou identificador ausente, repetido ou estranho ao lote.")
+                    by_id[publication_id] = item
+                for publication in batch:
+                    publication_id = clean_str(publication.get("id"))
+                    item = by_id.get(publication_id)
+                    if item is None:
+                        raise RuntimeError(f"O Gemini não classificou a publicação {publication_id}.")
+                    matched = item.get("matched_themes") if isinstance(item.get("matched_themes"), list) else []
+                    matched = list(dict.fromkeys(str(value) for value in matched if str(value) in allowed_names))
+                    relevant = bool(item.get("relevant")) and bool(matched)
+                    previous = previous_by_publication.get(publication_id) or {}
+                    try:
+                        confidence = float(item.get("confidence")) if item.get("confidence") is not None else None
+                        if confidence is not None and not 0 <= confidence <= 1:
+                            confidence = max(0.0, min(1.0, confidence))
+                    except (TypeError, ValueError):
+                        confidence = None
+                    classified_rows.append({
+                        "user_id": user_id,
+                        "edition_id": edition_id,
+                        "publication_id": publication_id,
+                        "theme_signature": theme_signature,
+                        "relevant": relevant,
+                        "matched_themes": matched if relevant else [],
+                        "confidence": confidence,
+                        "justification": clean_str(item.get("justification"), "")[:1000] or None if relevant else None,
+                        "summary": clean_str(item.get("summary"), "")[:1800] or None if relevant else None,
+                        "manual_relevance": previous.get("manual_relevance"),
+                        "manual_note": previous.get("manual_note"),
+                        "reviewed_at": previous.get("reviewed_at"),
+                    })
+                if offset + batch_size < len(publications):
+                    time.sleep(1.2)
+
+            for offset in range(0, len(classified_rows), 100):
+                db_post(
+                    "user_publication_matches",
+                    classified_rows[offset:offset + 100],
+                    on_conflict="user_id,publication_id",
+                )
+
+            relevant_rows = [row for row in classified_rows if row["relevant"]]
+            summary = ""
+            if relevant_rows:
+                publication_by_id = {clean_str(p.get("id")): p for p in publications}
+                highlights = []
+                for row in relevant_rows[:35]:
+                    publication = publication_by_id.get(row["publication_id"], {})
+                    highlights.append({
+                        "title": publication.get("title"),
+                        "kind": publication.get("kind"),
+                        "themes": row["matched_themes"],
+                        "summary": row["summary"],
+                    })
+                summary_prompt = f"""Elabore uma síntese personalizada da edição {edition_date} ({edition_label}) do Diário Oficial, Parte II — Poder Legislativo, para este usuário, considerando exclusivamente os temas e correspondências abaixo. Indique os assuntos que mais aparecem, sem inventar fatos. Escreva um único parágrafo institucional de 90 a 150 palavras.
+
+TEMAS DO USUÁRIO: {json.dumps([t['name'] for t in themes_for_prompt], ensure_ascii=False)}
+
+DESTAQUES: {json.dumps(highlights, ensure_ascii=False)}"""
+                try:
+                    summary_parsed = gemini_json(summary_prompt, 1200)
+                    if isinstance(summary_parsed, dict):
+                        summary = clean_str(summary_parsed.get("summary"))[:2600]
+                except Exception as summary_error:
+                    print(f"Síntese personalizada não gerada para usuário {user_id[:8]}…: {summary_error}")
+            if not summary:
+                summary = (
+                    f"Foram identificadas {len(relevant_rows)} publicações relacionadas aos seus temas nesta edição, "
+                    f"entre {len(publications)} publicações analisadas. Consulte os destaques para ver os temas e resumos individuais."
+                    if relevant_rows else
+                    f"Foram analisadas {len(publications)} publicações. Nenhuma apresentou correspondência suficientemente clara com os seus temas ativos nesta edição."
+                )
+
+            db_patch("user_edition_analyses", {
+                "user_id": f"eq.{user_id}",
+                "edition_id": f"eq.{edition_id}",
+            }, {
+                "status": "processed",
+                "summary": summary,
+                "publication_count": len(publications),
+                "relevant_count": len(relevant_rows),
+                "error": None,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            results["processed"] += 1
+            print(
+                f"Análise personalizada concluída para conta {user_number}/{len(themes_by_user)}: "
+                f"{len(relevant_rows)} destaques em {len(publications)} publicações."
+            )
+        except Exception as user_error:
+            results["failed"] += 1
+            message = clean_str(user_error)[:1800]
+            print(f"Falha na análise personalizada para conta {user_number}/{len(themes_by_user)}: {message}", file=sys.stderr)
+            if analysis_started and theme_signature:
+                try:
+                    db_patch("user_edition_analyses", {
+                        "user_id": f"eq.{user_id}",
+                        "edition_id": f"eq.{edition_id}",
+                    }, {
+                        "status": "error",
+                        "error": message,
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception as status_error:
+                    print(f"Não foi possível registrar o erro da análise do usuário: {status_error}", file=sys.stderr)
+
+    return results
+
+
+def edition_exists(edition_date: str, edition_key: str) -> dict[str, Any] | None:
+    found = db_get("editions", {
+        "select": "id,edition_date,edition_type,edition_key,pdf_sha256,status",
+        "edition_date": f"eq.{edition_date}",
+        "edition_key": f"eq.{edition_key}",
+        "limit": "1",
+    })
+    return found[0] if found else None
+
+
+
+def process_source(source: dict[str, Any]) -> None:
+    edition_date = source["edition_date"]
+    edition_type = source["edition_type"]
+    run_rows = db_post("ingestion_runs", {
+        "status": "running",
+        "edition_date": edition_date,
+        "edition_type": edition_type,
+        "message": f"Iniciando coleta: {source['edition_label']}.",
+    })
     run_id = run_rows[0]["id"] if run_rows else None
-    edition_date = None
     existing = None
+    edition_key = "regular" if edition_type == "regular" else None
     preserve_processed_edition = False
     try:
-        source = discover_latest()
-        edition_date = source["edition_date"]
-        print(f"Edição detectada no calendário: {edition_date} — {source['edition_label']}")
+        print(f"Edição detectada: {edition_date} — {source['edition_label']} ({edition_type})")
         print(f"Página de seleção da edição: {source['selection_url']}")
         print(f"Link identificado como Parte II — Poder Legislativo: {source['part_ii_url']}")
 
         pdf_url, part_url, content = find_pdf_and_html(source["part_ii_url"])
         pdf_info = validate_part_ii_pdf(content, expected_date=edition_date)
         pdf_hash = sha256(content)
+        # A chave do extra deriva do conteúdo do PDF: a mesma edição é
+        # reconhecida na checagem seguinte, e extras diferentes do mesmo dia
+        # recebem chaves distintas.
+        edition_key = "regular" if edition_type == "regular" else f"extra-{pdf_hash[:20]}"
+        if run_id:
+            db_patch("ingestion_runs", {"id": f"eq.{run_id}"}, {"edition_key": edition_key})
         print(
             "Validação do PDF aprovada: Parte II — Poder Legislativo; "
-            f"data impressa={pdf_info['document_date']}; páginas={pdf_info['page_count']}; "
-            f"autor={pdf_info.get('author')!r}; criador={pdf_info.get('creator')!r}."
+            f"tipo={edition_type}; data impressa={pdf_info['document_date']}; "
+            f"páginas={pdf_info['page_count']}; autor={pdf_info.get('author')!r}; "
+            f"criador={pdf_info.get('creator')!r}."
         )
         print(f"URL do visualizador/arquivo-fonte: {pdf_url}")
 
-        existing = edition_exists(edition_date, pdf_hash)
+        existing = edition_exists(edition_date, edition_key)
         if existing and existing.get("pdf_sha256") == pdf_hash and existing.get("status") == "processed":
-            log_run("success", "Edição já processada; nenhuma duplicidade criada.", edition_date, run_id=run_id)
-            print("Edição já processada. Encerrando.")
-            return
+            # Atualiza o rótulo caso o portal passe a listar outra quantidade de extras.
+            db_patch("editions", {"id": f"eq.{existing['id']}"}, {"edition_label": source["edition_label"]})
+            cached_analysis = {"users": 0, "processed": 0, "failed": 0}
+            analysis_note = ""
+            if edition_type == "extra":
+                # Mesmo sem republicar o PDF, reavalia contas cuja análise ficou
+                # em erro na tentativa anterior; contas já concluídas batem no cache.
+                cached_analysis = analyze_edition_for_users(existing["id"], edition_date, source["edition_label"])
+                analysis_note = (
+                    f" Análise personalizada: {cached_analysis['processed']}/{cached_analysis['users']} usuário(s) "
+                    f"processado(s), {cached_analysis['failed']} falha(s)."
+                )
+            status = "warning" if cached_analysis["failed"] else "success"
+            log_run(status, "Edição já coletada; sem nova segmentação." + analysis_note, edition_date, edition_type, run_id=run_id, edition_key=edition_key)
+            print("Edição já processada; verificação de análises pessoais concluída.")
+            return cached_analysis
         preserve_processed_edition = bool(existing and existing.get("status") == "processed")
 
         pages = extract_pdf_pages(content)
         if not pages or sum(len(page["text"]) for page in pages) < 500:
             raise RuntimeError("Não foi extraído texto suficiente do PDF da Parte II. A edição não foi marcada como processada.")
 
-        themes = load_themes()
+        # A segmentação é comum a todo o acervo. A classificação das edições
+        # extras será executada abaixo separadamente por usuário; nas regulares,
+        # ela continua sob demanda pela Edge Function autenticada.
         chunks = make_chunks(pages)
         if not chunks:
             raise RuntimeError("Não foi possível criar lotes de texto a partir do PDF da Parte II.")
 
         all_items: list[dict[str, Any]] = []
         for number, chunk in enumerate(chunks, start=1):
-            print(f"Analisando lote {number}/{len(chunks)} (páginas {chunk['start_page']}–{chunk['end_page']}).")
-            all_items.extend(classify_chunk(chunk, edition_date, themes))
+            print(f"Segmentando lote {number}/{len(chunks)} (páginas {chunk['start_page']}–{chunk['end_page']}).")
+            all_items.extend(classify_chunk(chunk, edition_date))
             if number < len(chunks):
-                time.sleep(7.0)  # Ritmo conservador para respeitar cotas do plano gratuito do Gemini.
+                time.sleep(7.0)
 
         deduped: dict[str, dict[str, Any]] = {}
         for item in all_items:
@@ -890,24 +1317,18 @@ def process() -> None:
             title = clean_str(item.get("title"), "Publicação sem título")
             if not body and title == "Publicação sem título":
                 continue
-            key = publication_key(edition_date, item)
+            key = publication_key(edition_date, item, edition_type, edition_key)
             if key not in deduped or len(body) > len(clean_str(deduped[key].get("text"))):
                 deduped[key] = item
 
         publications = list(deduped.values())
         if not publications:
-            raise RuntimeError(
-                "O Gemini não segmentou nenhuma publicação a partir do PDF validado. "
-                "A edição anterior, caso exista, foi preservada."
-            )
+            raise RuntimeError("O Gemini não segmentou nenhuma publicação a partir do PDF validado. A edição anterior, caso exista, foi preservada.")
 
         rows = []
-        relevant_count = 0
         for item in publications:
-            relevant = bool(item.get("relevant")) and bool(item.get("matched_themes"))
-            relevant_count += int(relevant)
             rows.append({
-                "external_key": publication_key(edition_date, item),
+                "external_key": publication_key(edition_date, item, edition_type, edition_key),
                 "page_start": item.get("page_start"),
                 "page_end": item.get("page_end"),
                 "kind": clean_str(item.get("type"), "Não identificado"),
@@ -917,28 +1338,29 @@ def process() -> None:
                 "people": item.get("people") if isinstance(item.get("people"), list) else [],
                 "municipalities": item.get("municipalities") if isinstance(item.get("municipalities"), list) else [],
                 "amounts": item.get("amounts") if isinstance(item.get("amounts"), list) else [],
-                "ai_relevant": relevant,
-                "matched_themes": item.get("matched_themes", []) if relevant else [],
-                "confidence": item.get("confidence"),
-                "justification": clean_str(item.get("justification")) if relevant else None,
-                "summary": clean_str(item.get("summary")) if relevant else None,
+                # Esses campos antigos permanecem por compatibilidade; a
+                # relevância nova é armazenada por usuário, não globalmente.
+                "ai_relevant": False,
+                "matched_themes": [],
+                "confidence": None,
+                "justification": None,
+                "summary": None,
                 "source_url": part_url,
             })
 
         try:
-            summary = daily_summary(edition_date, publications)
+            summary = daily_summary(edition_date, publications, edition_type)
         except Exception as summary_exc:
-            print(f"Aviso: não foi possível gerar a síntese diária; os atos serão preservados: {summary_exc}")
+            print(f"Aviso: não foi possível gerar a síntese geral; os atos serão preservados: {summary_exc}")
             summary = (
-                f"A edição de {edition_date} foi processada e contém {len(publications)} publicações. "
-                "A síntese automática não foi disponibilizada nesta execução; consulte os registros individuais."
+                f"A {'edição extra' if edition_type == 'extra' else 'edição regular'} de {edition_date} "
+                f"foi processada e contém {len(publications)} publicações. Consulte os registros individuais."
             )
 
-        # Só altera a edição no banco depois de concluir a extração e toda a
-        # análise de IA. Assim, uma falha de navegador/Gemini não apaga dados
-        # existentes nem marca uma edição antiga como erro.
         edition_payload = {
             "edition_date": edition_date,
+            "edition_type": edition_type,
+            "edition_key": edition_key,
             "edition_label": source["edition_label"],
             "source_page_url": source["selection_url"],
             "source_pdf_url": pdf_url,
@@ -947,11 +1369,16 @@ def process() -> None:
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "error": None,
         }
-        edition_rows = db_post("editions", edition_payload, on_conflict="edition_date")
+        edition_rows = db_post("editions", edition_payload, on_conflict="edition_date,edition_key")
         if edition_rows:
             edition_id = edition_rows[0]["id"]
         else:
-            found = db_get("editions", {"select": "id", "edition_date": f"eq.{edition_date}", "limit": "1"})
+            found = db_get("editions", {
+                "select": "id",
+                "edition_date": f"eq.{edition_date}",
+                "edition_key": f"eq.{edition_key}",
+                "limit": "1",
+            })
             if not found:
                 raise RuntimeError("A edição foi processada, mas não foi possível recuperar seu ID no Supabase.")
             edition_id = found[0]["id"]
@@ -959,8 +1386,6 @@ def process() -> None:
         for row in rows:
             row["edition_id"] = edition_id
 
-        # Primeiro grava todos os itens novos/atualizados. Só depois remove
-        # publicações antigas que não pertençam mais ao PDF validado.
         for offset in range(0, len(rows), 60):
             db_post("publications", rows[offset:offset + 60], on_conflict="external_key")
 
@@ -969,10 +1394,7 @@ def process() -> None:
             "publications",
             {"select": "id,external_key", "edition_id": f"eq.{edition_id}", "limit": "5000"},
         ) or []
-        obsolete_ids = [
-            row["id"] for row in existing_publications
-            if row.get("external_key") not in desired_keys
-        ]
+        obsolete_ids = [row["id"] for row in existing_publications if row.get("external_key") not in desired_keys]
         for offset in range(0, len(obsolete_ids), 100):
             id_list = ",".join(obsolete_ids[offset:offset + 100])
             db_delete("publications", {"id": f"in.({id_list})"})
@@ -986,25 +1408,148 @@ def process() -> None:
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "processed_at": datetime.now(timezone.utc).isoformat(),
             "publication_count": len(rows),
-            "relevant_count": relevant_count,
+            # A quantidade de destaques é por usuário, portanto não é gravada
+            # como um número único na tabela compartilhada de edições.
+            "relevant_count": 0,
             "daily_summary": summary,
             "error": None,
         })
-        log_run("success", f"Edição processada. {len(rows)} publicações; {relevant_count} relevantes. PDF não armazenado.", edition_date, len(rows), relevant_count, run_id)
-        print(f"Concluído: {len(rows)} atos, {relevant_count} relevantes. PDF descartado ao final do processo.")
+
+        analysis_note = ""
+        analysis_result = {"users": 0, "processed": 0, "failed": 0}
+        if edition_type == "extra":
+            # Edições extras são classificadas previamente para cada conta que
+            # tenha temas cadastrados. A classificação e os resumos ficam sempre
+            # vinculados ao user_id; não há resultado temático global.
+            try:
+                analysis = analyze_edition_for_users(edition_id, edition_date, source["edition_label"])
+                analysis_result = analysis
+                analysis_note = (
+                    f" Análise personalizada: {analysis['processed']}/{analysis['users']} usuário(s) processado(s), "
+                    f"{analysis['failed']} falha(s)."
+                )
+                if analysis["failed"]:
+                    print("A edição foi coletada; uma ou mais análises personalizadas precisam de nova tentativa.", file=sys.stderr)
+            except Exception as analysis_exc:
+                analysis_result = {"users": 0, "processed": 0, "failed": 1}
+                analysis_note = f" Falha ao iniciar análises personalizadas por usuário: {analysis_exc}"
+                print(analysis_note, file=sys.stderr)
+
+        log_run("success", f"{source['edition_label']} processada. {len(rows)} publicações. PDF não armazenado.{analysis_note}", edition_date, edition_type, len(rows), 0, run_id, edition_key)
+        print(f"Concluído: {len(rows)} atos. Tipo da edição: {edition_type}. PDF descartado ao final do processo.")
+        return analysis_result
 
     except Exception as exc:
         message = f"Falha na coleta/processamento: {exc}"
         print(message, file=sys.stderr)
         try:
-            # Não altera o status de uma edição que já estava processada: em
-            # reprocessamentos malsucedidos, seus dados continuam válidos.
-            if edition_date and not preserve_processed_edition:
-                db_patch("editions", {"edition_date": f"eq.{edition_date}"}, {"status": "error", "error": message})
-            log_run("error", message, edition_date, run_id=run_id)
+            if edition_date and edition_key and not preserve_processed_edition:
+                prior_on_error = edition_exists(edition_date, edition_key)
+                if not prior_on_error or prior_on_error.get("status") != "processed":
+                    db_patch("editions", {
+                        "edition_date": f"eq.{edition_date}",
+                        "edition_key": f"eq.{edition_key}",
+                    }, {"status": "error", "error": message})
+            log_run("error", message, edition_date, edition_type, run_id=run_id, edition_key=edition_key)
         except Exception as log_exc:
             print(f"Também não foi possível registrar a falha no banco: {log_exc}", file=sys.stderr)
         raise
+
+
+def process() -> None:
+    mode = os.getenv("EDITION_SCAN_MODE", "regular").strip().lower()
+    if mode not in {"regular", "extra", "both"}:
+        raise RuntimeError("EDITION_SCAN_MODE deve ser regular, extra ou both.")
+
+    modes = ["regular", "extra"] if mode == "both" else [mode]
+    failures = []
+    for edition_type in modes:
+        today = datetime.now(ZoneInfo(TZ)).date().isoformat()
+        try:
+            sources = discover_editions(edition_type)
+        except Exception as exc:
+            message = f"Falha ao verificar a edição {edition_type} no calendário da IOERJ: {exc}"
+            db_post("ingestion_runs", {
+                "status": "error",
+                "edition_date": today,
+                "edition_type": edition_type,
+                "message": message,
+                "publications_found": 0,
+                "publications_relevant": 0,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            failures.append(f"{edition_type}: {exc}")
+            continue
+
+        if not sources:
+            if edition_type == "extra":
+                db_post("ingestion_runs", {
+                    "status": "success",
+                    "edition_date": today,
+                    "edition_type": "extra",
+                    "message": "Checagem concluída: o portal não disponibilizou edição extra da Parte II para esta data.",
+                    "publications_found": 0,
+                    "publications_relevant": 0,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                print(f"Nenhuma edição extra da Parte II identificada em {today}.")
+            else:
+                failures.append("regular: o portal não disponibilizou o link obrigatório da Parte II.")
+            continue
+
+        if edition_type == "extra":
+            print(f"Foram encontradas {len(sources)} edição(ões) extra(s) da Parte II para {sources[0]['edition_date']}.")
+
+        type_failures = []
+        successful_sources = 0
+        user_analysis_failures = 0
+        for source in sources:
+            try:
+                source_result = process_source(source) or {}
+                user_analysis_failures += int(source_result.get("failed", 0))
+                successful_sources += 1
+            except Exception as exc:
+                detail = f"{source.get('edition_label', '')}: {exc}"
+                type_failures.append(detail)
+                failures.append(f"{edition_type} {detail}")
+                # Em modo 'both', e também quando houver várias extras, tenta
+                # processar os demais cadernos mesmo se um deles falhar.
+                continue
+
+        if edition_type == "extra":
+            if type_failures:
+                check_status = "error"
+                check_message = (
+                    f"Verificação encontrou {len(sources)} edição(ões) extra(s): "
+                    f"{successful_sources} processada(s), {len(type_failures)} com falha de coleta. "
+                    + " | ".join(type_failures)
+                )
+            elif user_analysis_failures:
+                check_status = "warning"
+                check_message = (
+                    f"{len(sources)} edição(ões) extra(s) coletada(s), mas houve "
+                    f"{user_analysis_failures} falha(s) de análise personalizada por usuário. "
+                    "As contas afetadas poderão tentar novamente ao abrir a edição."
+                )
+            else:
+                check_status = "success"
+                check_message = (
+                    f"Verificação concluída: {len(sources)} edição(ões) extra(s) da Parte II "
+                    "identificada(s), processada(s) e analisada(s) para as contas com temas cadastrados."
+                )
+            db_post("ingestion_runs", {
+                "status": check_status,
+                "edition_date": today,
+                "edition_type": "extra",
+                "message": check_message,
+                "publications_found": 0,
+                "publications_relevant": 0,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            if user_analysis_failures:
+                failures.append(f"extra: {user_analysis_failures} análise(s) personalizada(s) falharam")
+    if failures:
+        raise RuntimeError("Uma ou mais coletas falharam: " + " | ".join(failures))
 
 
 if __name__ == "__main__":
