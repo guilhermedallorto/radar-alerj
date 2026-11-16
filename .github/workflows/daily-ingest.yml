@@ -2,9 +2,9 @@ name: Radar ALERJ — coleta diária
 
 on:
   schedule:
-    # 09h15 no fuso America/Sao_Paulo, todos os dias.
-    # O GitHub pode atrasar execuções agendadas em períodos de alta demanda.
-    - cron: '15 9 * * *'
+    # 09h05 no fuso de Brasília (America/Sao_Paulo), todos os dias.
+    # O minuto 05 evita o pico de agendamentos no início da hora.
+    - cron: '5 9 * * *'
       timezone: 'America/Sao_Paulo'
   workflow_dispatch:
 
@@ -17,10 +17,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Baixar código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Preparar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
