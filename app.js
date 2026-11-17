@@ -2,14 +2,33 @@
   const cfg = window.RADAR_CONFIG || {};
   const $ = (id) => document.getElementById(id);
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const fmtDate = (value, options = { day:'2-digit', month:'short', year:'numeric' }) => {
+
+  const SITE_TIME_ZONE = 'America/Sao_Paulo';
+
+  const fmtDate = (
+    value,
+    options = { day:'2-digit', month:'short', year:'numeric' }
+  ) => {
     if (!value) return 'Data não identificada';
-    const d = new Date(`${String(value).slice(0,10)}T12:00:00-03:00`);
-    return Number.isNaN(d.getTime()) ? String(value) : new Intl.DateTimeFormat('pt-BR', options).format(d);
+
+    const raw = String(value).trim();
+    const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+    const dateToParse = isDateOnly ? `${raw}T12:00:00Z` : raw;
+    const d = new Date(dateToParse);
+
+    if (Number.isNaN(d.getTime())) return raw;
+
+    return new Intl.DateTimeFormat('pt-BR', {
+      ...options,
+      timeZone: SITE_TIME_ZONE,
+      hourCycle: 'h23'
+    }).format(d);
   };
+
   const safeUrl = (value) => {
     try { const u = new URL(value); return ['https:','http:'].includes(u.protocol) ? u.href : '#'; } catch { return '#'; }
   };
+
   let client = null;
   let currentUser = null;
   let editions = [];
@@ -28,11 +47,13 @@
     const node = $('toast'); node.textContent = message; node.classList.remove('hidden');
     clearTimeout(toast.timer); toast.timer = setTimeout(() => node.classList.add('hidden'), 4200);
   }
+
   function isRelevant(pub) {
     if (pub.manual_relevance === true) return true;
     if (pub.manual_relevance === false) return false;
     return !!pub.user_relevant;
   }
+
   function mergeUserMatch(pub, match, analysisStatus = null) {
     return {
       ...pub,
@@ -47,6 +68,7 @@
       user_analysis_status: analysisStatus || (match ? 'processed' : null)
     };
   }
+
   async function attachUserMatches(publications) {
     const ids = publications.map(p => p.id).filter(Boolean);
     if (!ids.length) return publications.map(p => mergeUserMatch(p, null));
@@ -70,15 +92,18 @@
       return mergeUserMatch(p, match, status);
     });
   }
+
   function pageText(p) {
     if (p.page_start && p.page_end && p.page_start !== p.page_end) return `pp. ${p.page_start}–${p.page_end}`;
     if (p.page_start) return `p. ${p.page_start}`;
     return 'página não identificada';
   }
+
   function publicationTags(pub) {
     const names = Array.isArray(pub.user_matched_themes) ? pub.user_matched_themes : [];
     return names.map(name => `<span class="tag">${esc(name)}</span>`).join(' ');
   }
+
   function renderCard(pub) {
     const rel = isRelevant(pub);
     const itemSummary = pub.user_summary;
@@ -94,6 +119,7 @@
       <div class="card-actions"><button data-open-pub="${esc(pub.id)}">Ler publicação →</button><button data-review="${esc(pub.id)}">Revisar classificação</button></div>
     </article>`;
   }
+
   function switchView(view) {
     currentView = view;
     document.querySelectorAll('.nav-tab').forEach(b => b.classList.toggle('active', b.dataset.view === view));
@@ -102,12 +128,14 @@
     if (view === 'themes') renderThemes();
     if (view === 'history') renderHistory();
   }
+
   async function init() {
     if (!cfg.SUPABASE_URL || !cfg.SUPABASE_PUBLISHABLE_KEY || !window.supabase?.createClient) {
       $('login-error').textContent = 'Configure config.js com a URL e a chave pública do Supabase. Consulte o README.';
       $('login-error').classList.remove('hidden');
       return;
     }
+
     client = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_PUBLISHABLE_KEY, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
     });
@@ -120,19 +148,25 @@
       }
     });
   }
+
   async function enterApp(user) {
     currentUser = user;
     $('login-screen').classList.add('hidden'); $('app').classList.remove('hidden');
-    $('header-date').textContent = new Intl.DateTimeFormat('pt-BR',{dateStyle:'full'}).format(new Date());
+    $('header-date').textContent = new Intl.DateTimeFormat('pt-BR', {
+      dateStyle: 'full',
+      timeZone: SITE_TIME_ZONE
+    }).format(new Date());
     try { await loadDashboard(); }
     catch (e) { toast(`Não foi possível carregar o Radar: ${e.message}`); console.error(e); }
   }
+
   async function login(event) {
     event.preventDefault();
     $('login-error').classList.add('hidden');
     const { error } = await client.auth.signInWithPassword({ email: $('email').value.trim(), password: $('password').value });
     if (error) { $('login-error').textContent = error.message; $('login-error').classList.remove('hidden'); }
   }
+
   async function loadDashboard() {
     const [edRes, themeRes, runRes] = await Promise.all([
       client.from('editions').select('*').order('edition_date', { ascending:false }).limit(30),
@@ -149,6 +183,7 @@
     if (editions.length) await selectEdition(editions[0].id);
     else renderEmptyDashboard();
   }
+
   function renderEmptyDashboard() {
     $('edition-title').textContent = 'Nenhuma edição processada';
     $('edition-subtitle').textContent = 'A primeira coleta será iniciada pelo fluxo de automação do projeto.';
@@ -156,12 +191,14 @@
     $('edition-stats').innerHTML = ['0|Publicações identificadas','0|Destaques temáticos','0|Temas ativos','—|Última edição'].map(x=>{const [n,l]=x.split('|');return `<div class="stat-card"><span class="stat-number">${n}</span><span class="stat-label">${l}</span></div>`}).join('');
     $('highlights').innerHTML = '<div class="empty-state">O acervo ainda não possui publicações processadas.</div>';
   }
+
   function renderTopicRow() {
     const active = themes.filter(t => t.active);
     const counts = {};
     currentPubs.forEach(p => (Array.isArray(p.user_matched_themes)?p.user_matched_themes:[]).forEach(n => counts[n]=(counts[n]||0)+1));
     $('topic-row').innerHTML = `<span class="topic-label">MONITORAMENTO</span>${active.length ? active.map(t=>`<button class="topic-pill" data-topic-filter="${esc(t.name)}">${esc(t.name)} <strong>${counts[t.name]||0}</strong></button>`).join('') : '<span class="muted tiny">Nenhum tema ativo. Cadastre temas para personalizar o Radar.</span>'}`;
   }
+
   function renderEditionChecks() {
     const latestByType = {};
     for (const run of ingestionRuns) {
@@ -178,12 +215,14 @@
     const node = $('edition-check-status');
     if (node) node.innerHTML = renderCheck('regular','Edição regular','Checagem diária') + renderCheck('extra','Edição extra','Verificação adicional');
   }
+
   function renderEditionTabs() {
     const regular = editions.filter(e => (e.edition_type || 'regular') === 'regular').slice(0, 10);
     const extra = editions.filter(e => e.edition_type === 'extra').slice(0, 10);
     const renderGroup = (items, label, type) => `<div class="edition-tabs-group"><div class="edition-tabs-label">${label}</div>${items.length ? items.map(e=>`<button class="edition-tab ${currentEdition?.id===e.id?'active':''}" data-edition="${esc(e.id)}"><strong>${esc(fmtDate(e.edition_date,{day:'2-digit',month:'short'}))}</strong><small>${type==='extra'?`<span class="edition-extra-tag">${esc((e.edition_label||'').match(/EDIÇÃO EXTRA\s+\d+/i)?.[0]||'EDIÇÃO EXTRA')}</span> · `:''}${Number(e.publication_count||0)} atos</small></button>`).join('') : `<span class="muted tiny">${type==='extra'?'Nenhuma edição extra localizada.':'Nenhuma edição regular localizada.'}</span>`}</div>`;
     $('edition-tabs').innerHTML = renderGroup(regular, 'EDIÇÕES REGULARES', 'regular') + renderGroup(extra, 'EDIÇÕES EXTRAS', 'extra');
   }
+
   async function selectEdition(id) {
     currentEdition = editions.find(e => e.id === id) || null;
     currentAnalysis = null;
@@ -219,6 +258,7 @@
     currentPubs = currentPubs.map(p => mergeUserMatch(p, matchByPublication.get(p.id), editionAnalysisStatus));
     renderEditionTabs(); renderTopicRow(); renderDaily();
   }
+
   function renderDaily() {
     const e = currentEdition;
     $('edition-weekday').textContent = e ? fmtDate(e.edition_date,{weekday:'long'}) : 'EDIÇÃO SELECIONADA';
@@ -242,6 +282,7 @@
     const groups = Object.entries(grouped).sort((a,b)=>b[1].length-a[1].length);
     $('other-publications').innerHTML = groups.length ? groups.map(([kind,items])=>`<section class="other-group"><div class="other-group-head"><span>${esc(kind)}</span><span>${items.length}</span></div>${items.slice(0,8).map(p=>`<div class="other-item"><div><strong>${esc(p.title)}</strong><small>${esc(pageText(p))} · ${esc(p.organization||'Órgão não identificado')}</small></div><button data-open-pub="${esc(p.id)}">Abrir →</button></div>`).join('')}${items.length>8?`<div class="other-item"><small>Mais ${items.length-8} publicação(ões) nesta categoria.</small><button data-go="publications">Ver tudo →</button></div>`:''}</section>`).join('') : '<div class="empty-state">Não há outras publicações nesta edição.</div>';
   }
+
   async function loadPublications(append = false) {
     if (!append) publicationOffset = 0;
     const query = $('publication-query').value.trim();
@@ -268,12 +309,15 @@
     else $('publication-results').innerHTML = html || '<div class="empty-state">Nenhuma publicação encontrada com esses filtros.</div>';
     $('pub-load-more').classList.toggle('hidden', page.length < publicationPageSize);
   }
+
   function renderThemes() {
     $('theme-list').innerHTML = themes.length ? themes.map(t=>`<article class="theme-item"><div><h3>${esc(t.name)} ${t.active?'<span class="tag green">Ativo</span>':'<span class="tag neutral">Inativo</span>'}</h3><p>${esc(t.description||'Sem descrição')} · Prioridade ${t.priority||3}</p><p>Palavras-chave: ${esc((t.keywords||[]).join(', ')||'não cadastradas')}</p></div><div class="theme-actions"><button data-edit-theme="${esc(t.id)}">Editar</button><button data-toggle-theme="${esc(t.id)}">${t.active?'Desativar':'Ativar'}</button></div></article>`).join('') : '<div class="empty-state">Cadastre o primeiro tema que o Radar deverá monitorar.</div>';
   }
+
   function clearThemeForm() {
     $('theme-form').reset(); $('theme-id').value=''; $('theme-priority').value='3'; $('theme-active').checked=true; $('theme-cancel').classList.add('hidden');
   }
+
   async function saveTheme(event) {
     event.preventDefault();
     const id = $('theme-id').value;
@@ -284,17 +328,20 @@
     const refreshed = await client.from('themes').select('*').order('priority');
     themes = refreshed.data || []; clearThemeForm(); renderThemes(); renderTopicRow(); if(currentEdition) await selectEdition(currentEdition.id); toast('Tema salvo. Os destaques desta edição foram recalculados para sua conta.');
   }
+
   async function editTheme(id) {
     const t=themes.find(x=>x.id===id); if(!t)return;
     $('theme-id').value=t.id;$('theme-name').value=t.name;$('theme-description').value=t.description||'';$('theme-keywords').value=(t.keywords||[]).join(', ');$('theme-include').value=t.include_criteria||'';$('theme-exclude').value=t.exclude_criteria||'';$('theme-priority').value=String(t.priority||3);$('theme-active').checked=!!t.active;$('theme-cancel').classList.remove('hidden');
     window.scrollTo({top:0,behavior:'smooth'});
   }
+
   async function toggleTheme(id) {
     const t=themes.find(x=>x.id===id); if(!t)return;
     const {error}=await client.from('themes').update({active:!t.active}).eq('id',id);
     if(error){toast(error.message);return;}
     t.active=!t.active;renderThemes();renderTopicRow();if(currentEdition)await selectEdition(currentEdition.id);toast(`Tema ${t.active?'ativado':'desativado'}.`);
   }
+
   async function openPublication(id) {
     const {data,error}=await client.from('publications').select('*, editions(edition_date,edition_type,edition_label,source_pdf_url)').eq('id',id).single();
     if(error){toast(error.message);return;}
@@ -305,6 +352,7 @@
     $('modal-content').innerHTML=`<div class="section-kicker">${esc(p.kind||'PUBLICAÇÃO')} · ${esc(fmtDate(p.editions?.edition_date))}${extra}</div><h2 id="modal-title">${esc(p.title)}</h2><p class="muted tiny">${esc(pageText(p))} · ${esc(p.organization||'Órgão não identificado')}</p><div class="pub-meta">${rel?'<span class="tag green">Relevante para você</span>':'<span class="tag neutral">Demais atos</span>'}${publicationTags(p)}</div>${p.user_summary?`<div class="why-box"><strong>Resumo para seus temas</strong>${esc(p.user_summary)}</div>`:''}${p.user_justification?`<div class="why-box"><strong>Por que importa</strong>${esc(p.user_justification)}</div>`:''}<h3 style="font-size:12px;margin:20px 0 8px">Texto da publicação</h3><div class="full-text">${esc(p.body_text)}</div><p style="margin-top:14px"><a class="btn btn-outline" href="${editUrl}" target="_blank" rel="noopener">Abrir / baixar Diário Oficial ↗</a></p><div class="card-actions"><button data-review="${esc(p.id)}">Revisar classificação</button><span class="muted tiny">Classificação automática personalizada: ${isRelevant(p)?'relevante':'não relevante'}</span></div>`;
     $('publication-modal').classList.remove('hidden');
   }
+
   async function reviewPublication(id) {
     const selected=window.prompt('Classificação final para sua conta: digite R para relevante ou I para irrelevante. Deixe em branco para cancelar.');
     if(!selected)return;
@@ -335,6 +383,7 @@
     else await loadPublications(false);
     toast('Revisão particular da sua conta registrada.');
   }
+
   async function runResearch(event) {
     event.preventDefault();
     const question=$('research-question').value.trim(); if(!question)return;
@@ -348,6 +397,7 @@
     }catch(e){$('research-answer').innerHTML=`<p class="error">Não foi possível concluir a pesquisa: ${esc(e.message||String(e))}</p>`;}
     finally{btn.disabled=false;btn.textContent='Pesquisar no acervo';}
   }
+
   function renderHistory(lastRun = latestRun) {
     const ordered = [...editions].sort((a,b)=>String(b.edition_date).localeCompare(String(a.edition_date)) || ((a.edition_type === 'extra' ? 1 : 0) - (b.edition_type === 'extra' ? 1 : 0)));
     $('edition-history').innerHTML = ordered.length ? ordered.map(e=>`<div class="history-item"><strong>${esc(fmtDate(e.edition_date))}</strong><div><small>${e.edition_type==='extra'?'<span class="edition-extra-tag">EDIÇÃO EXTRA</span> · ':''}${esc(e.edition_label||'Parte II · Poder Legislativo')} · ${Number(e.publication_count||0)} atos</small></div><span class="status-pill ${e.status==='error'?'error':''}">${esc(e.status==='processed'?'Processada':e.status==='error'?'Erro':'Pendente')}</span><a href="${safeUrl(e.source_pdf_url||e.source_page_url)}" target="_blank" rel="noopener">Abrir Diário ↗</a></div>`).join('') : '<div class="empty-state">Nenhuma edição cadastrada.</div>';
@@ -372,6 +422,7 @@
     const go=event.target.closest('[data-go]'); if(go){switchView(go.dataset.go);return;}
     if(event.target.closest('[data-close-modal]')){$('publication-modal').classList.add('hidden');return;}
   });
+
   $('login-form').addEventListener('submit', login);
   $('logout-btn').addEventListener('click', async()=>{await client.auth.signOut();});
   $('global-search-btn').addEventListener('click',()=>{$('publication-query').value=$('global-search').value;selectedTheme='';$('publication-filter').value='all';$('publication-date').value='all';switchView('publications');});

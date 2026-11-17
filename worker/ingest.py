@@ -13,7 +13,7 @@ import re
 import sys
 import time
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -269,16 +269,23 @@ def discover_latest_from_calendar() -> tuple[date, str]:
     return result
 
 
-def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
-    """Localiza uma edição regular ou todas as extras da data local corrente."""
+def discover_editions(
+    edition_type: str = "regular",
+    target_date: date | None = None,
+) -> list[dict[str, Any]]:
+    """Localiza a edição regular ou todas as extras da data solicitada."""
     if edition_type not in {"regular", "extra"}:
         raise ValueError("edition_type deve ser 'regular' ou 'extra'.")
 
-    today_local = datetime.now(ZoneInfo(TZ)).date()
+    scan_date = target_date or datetime.now(ZoneInfo(TZ)).date()
+
     if edition_type == "extra":
-        calendar_result = discover_calendar_selection(today_local)
+        calendar_result = discover_calendar_selection(scan_date)
         if calendar_result is None:
-            print(f"O calendário da IOERJ ainda não lista {today_local.isoformat()}; nenhuma edição extra a conferir.")
+            print(
+                f"O calendário da IOERJ ainda não lista {scan_date.isoformat()}; "
+                "nenhuma edição extra a conferir nessa data."
+            )
             return []
     else:
         calendar_result = discover_latest_from_calendar()
@@ -288,16 +295,18 @@ def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
     latest_soup = BeautifulSoup(latest.text, "html.parser")
     page_url = latest.url
     edition_date = extract_date(latest_soup, page_url)
+
     if edition_date != calendar_date:
         raise RuntimeError(
             "A data da página da edição não corresponde à data codificada no calendário: "
             f"calendário={calendar_date.isoformat()}; página={edition_date.isoformat()}. "
             "A coleta foi interrompida para evitar selecionar outra edição."
         )
-    if edition_type == "extra" and edition_date != today_local:
+
+    if edition_type == "extra" and edition_date != scan_date:
         raise RuntimeError(
-            f"A checagem de edição extra deveria ser de hoje ({today_local.isoformat()}), "
-            f"mas o portal retornou {edition_date.isoformat()}."
+            f"A checagem de edição extra solicitada para {scan_date.isoformat()} "
+            f"retornou {edition_date.isoformat()}."
         )
 
     part_urls = find_part_ii_links(
@@ -306,17 +315,31 @@ def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
         edition_type=edition_type,
         required=(edition_type == "regular"),
     )
+
     if not part_urls:
-        print(f"A página de {edition_date.isoformat()} não apresenta link 'Parte II — Poder Legislativo — EDIÇÃO EXTRA'.")
+        print(
+            f"A página de {edition_date.isoformat()} não apresenta link "
+            "'Parte II — Poder Legislativo — EDIÇÃO EXTRA'."
+        )
         return []
+
     if edition_type == "regular" and len(part_urls) != 1:
         raise RuntimeError(
-            f"A página de {edition_date.isoformat()} apresentou {len(part_urls)} links de Parte II regular; "
-            "a coleta foi interrompida para evitar escolher um caderno ambíguo."
+            f"A página de {edition_date.isoformat()} apresentou {len(part_urls)} links "
+            "de Parte II regular; a coleta foi interrompida para evitar escolher "
+            "um caderno ambíguo."
         )
 
-    label_match = re.search(r"Ano\s+([IVXLCDM]+).*?N[º°o]\s*(\d+)", latest_soup.get_text(" ", strip=True), re.I)
-    base_label = f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}" if label_match else "Parte II · Poder Legislativo"
+    label_match = re.search(
+        r"Ano\s+([IVXLCDM]+).*?N[º°o]\s*(\d+)",
+        latest_soup.get_text(" ", strip=True),
+        re.I,
+    )
+    base_label = (
+        f"Ano {label_match.group(1).upper()} · Nº {label_match.group(2)}"
+        if label_match else "Parte II · Poder Legislativo"
+    )
+
     total = len(part_urls)
     results = []
     for index, part_url in enumerate(part_urls, start=1):
@@ -325,6 +348,7 @@ def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
             edition_label = f"{base_label} · EDIÇÃO EXTRA{ordinal}"
         else:
             edition_label = base_label
+
         results.append({
             "edition_date": edition_date.isoformat(),
             "edition_type": edition_type,
@@ -334,6 +358,7 @@ def discover_editions(edition_type: str = "regular") -> list[dict[str, Any]]:
             "selection_url": page_url,
             "part_ii_url": part_url,
         })
+
     return results
 
 
@@ -341,7 +366,6 @@ def discover_edition(edition_type: str = "regular") -> dict[str, Any] | None:
     """Compatibilidade com chamadas antigas; retorna a primeira edição encontrada."""
     editions = discover_editions(edition_type)
     return editions[0] if editions else None
-
 
 
 PDFJS_EXTRACT_JS = r"""
@@ -516,6 +540,7 @@ def find_pdf_and_html(part_url: str) -> tuple[str, str, bytes]:
     # a URL de origem verificável é a própria página oficial do visualizador.
     return str(extraction.get("url_visualizador") or part_url), part_url, pdf_bytes
 
+
 def validate_part_ii_pdf(pdf_bytes: bytes, expected_date: str | None = None) -> dict[str, Any]:
     """Confere assinatura, abertura, identificação do caderno e data da edição."""
     if not isinstance(pdf_bytes, (bytes, bytearray)) or not bytes(pdf_bytes).startswith(b"%PDF"):
@@ -549,8 +574,8 @@ def validate_part_ii_pdf(pdf_bytes: bytes, expected_date: str | None = None) -> 
 
         months = {
             "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5,
-            "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
-            "outubro": 10, "novembro": 11, "dezembro": 12,
+            "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10,
+            "novembro": 11, "dezembro": 12,
         }
         date_match = re.search(
             r"\b(\d{1,2})\s+de\s+(janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+(\d{4})\b",
@@ -584,7 +609,6 @@ def validate_part_ii_pdf(pdf_bytes: bytes, expected_date: str | None = None) -> 
         }
     finally:
         doc.close()
-
 
 def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
     """Extrai o texto por coluna, na ordem de leitura do Diário Oficial.
@@ -639,6 +663,7 @@ def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
             pages.append({"page": index, "text": text})
     doc.close()
     return pages
+
 
 def html_pages(html_bytes: bytes) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html_bytes, "html.parser")
@@ -740,6 +765,7 @@ def log_run(
         db_patch("ingestion_runs", {"id": f"eq.{run_id}"}, payload)
     else:
         db_post("ingestion_runs", {"status": status, **payload})
+
 
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
     """Solicita JSON ao Gemini com backoff para 429/503 e falhas de rede/timeout."""
@@ -1226,7 +1252,6 @@ DESTAQUES: {json.dumps(highlights, ensure_ascii=False)}"""
 
     return results
 
-
 def edition_exists(edition_date: str, edition_key: str) -> dict[str, Any] | None:
     found = db_get("editions", {
         "select": "id,edition_date,edition_type,edition_key,pdf_sha256,status",
@@ -1455,7 +1480,6 @@ def process_source(source: dict[str, Any]) -> None:
             print(f"Também não foi possível registrar a falha no banco: {log_exc}", file=sys.stderr)
         raise
 
-
 def process() -> None:
     mode = os.getenv("EDITION_SCAN_MODE", "regular").strip().lower()
     if mode not in {"regular", "extra", "both"}:
@@ -1463,91 +1487,150 @@ def process() -> None:
 
     modes = ["regular", "extra"] if mode == "both" else [mode]
     failures = []
+
     for edition_type in modes:
-        today = datetime.now(ZoneInfo(TZ)).date().isoformat()
-        try:
-            sources = discover_editions(edition_type)
-        except Exception as exc:
-            message = f"Falha ao verificar a edição {edition_type} no calendário da IOERJ: {exc}"
-            db_post("ingestion_runs", {
-                "status": "error",
-                "edition_date": today,
-                "edition_type": edition_type,
-                "message": message,
-                "publications_found": 0,
-                "publications_relevant": 0,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-            failures.append(f"{edition_type}: {exc}")
-            continue
+        check_started_at = datetime.now(timezone.utc)
+        today_local = datetime.now(ZoneInfo(TZ)).date()
+        today = today_local.isoformat()
+
+        # A checagem das extras verifica ontem e hoje. Isso recupera a edição
+        # do dia anterior quando o agendador atrasar e a execução atravessar
+        # a meia-noite. A deduplicação por hash impede reprocessamento do PDF.
+        scan_dates = (
+            [today_local - timedelta(days=1), today_local]
+            if edition_type == "extra"
+            else [None]
+        )
+
+        sources: list[dict[str, Any]] = []
+        discovery_failures: list[str] = []
+
+        for scan_date in scan_dates:
+            try:
+                found = discover_editions(edition_type, target_date=scan_date)
+                sources.extend(found)
+            except Exception as exc:
+                date_label = scan_date.isoformat() if scan_date else today
+                detail = f"{date_label}: {exc}"
+                discovery_failures.append(detail)
+                failures.append(f"{edition_type}: {detail}")
+                print(
+                    f"Falha ao localizar a edição {edition_type} para {date_label}: {exc}",
+                    file=sys.stderr,
+                )
+
+        dates_label = ", ".join(
+            item.isoformat() for item in scan_dates if item is not None
+        ) or today
 
         if not sources:
             if edition_type == "extra":
+                if discovery_failures:
+                    check_status = "error"
+                    check_message = (
+                        f"Falha na checagem de edições extras para {dates_label}: "
+                        + " | ".join(discovery_failures)
+                    )
+                else:
+                    check_status = "success"
+                    check_message = (
+                        f"Checagem concluída para {dates_label}: nenhuma edição extra "
+                        "da Parte II foi disponibilizada no calendário da IOERJ."
+                    )
+
                 db_post("ingestion_runs", {
-                    "status": "success",
+                    "status": check_status,
                     "edition_date": today,
                     "edition_type": "extra",
-                    "message": "Checagem concluída: o portal não disponibilizou edição extra da Parte II para esta data.",
+                    "started_at": check_started_at.isoformat(),
+                    "message": check_message,
                     "publications_found": 0,
                     "publications_relevant": 0,
                     "finished_at": datetime.now(timezone.utc).isoformat(),
                 })
-                print(f"Nenhuma edição extra da Parte II identificada em {today}.")
+                print(check_message)
             else:
-                failures.append("regular: o portal não disponibilizou o link obrigatório da Parte II.")
+                message = (
+                    "Falha ao consultar a edição regular: "
+                    + " | ".join(discovery_failures)
+                    if discovery_failures
+                    else "O portal não disponibilizou o link obrigatório da Parte II."
+                )
+                db_post("ingestion_runs", {
+                    "status": "error",
+                    "edition_date": today,
+                    "edition_type": "regular",
+                    "started_at": check_started_at.isoformat(),
+                    "message": message,
+                    "publications_found": 0,
+                    "publications_relevant": 0,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                failures.append(f"regular: {message}")
             continue
 
         if edition_type == "extra":
-            print(f"Foram encontradas {len(sources)} edição(ões) extra(s) da Parte II para {sources[0]['edition_date']}.")
+            print(
+                f"Foram encontradas {len(sources)} edição(ões) extra(s) da Parte II "
+                f"nas datas verificadas: {dates_label}."
+            )
 
         type_failures = []
         successful_sources = 0
         user_analysis_failures = 0
+
         for source in sources:
             try:
                 source_result = process_source(source) or {}
                 user_analysis_failures += int(source_result.get("failed", 0))
                 successful_sources += 1
             except Exception as exc:
-                detail = f"{source.get('edition_label', '')}: {exc}"
+                detail = f"{source.get('edition_label', '')} ({source.get('edition_date', '')}): {exc}"
                 type_failures.append(detail)
                 failures.append(f"{edition_type} {detail}")
-                # Em modo 'both', e também quando houver várias extras, tenta
-                # processar os demais cadernos mesmo se um deles falhar.
+                # Continua para processar as demais edições, mesmo se uma falhar.
                 continue
 
         if edition_type == "extra":
-            if type_failures:
+            if type_failures or discovery_failures:
                 check_status = "error"
+                all_errors = discovery_failures + type_failures
                 check_message = (
-                    f"Verificação encontrou {len(sources)} edição(ões) extra(s): "
-                    f"{successful_sources} processada(s), {len(type_failures)} com falha de coleta. "
-                    + " | ".join(type_failures)
+                    f"Verificação de extras para {dates_label}: {len(sources)} edição(ões) "
+                    f"encontrada(s), {successful_sources} processada(s), "
+                    f"{len(all_errors)} falha(s). " + " | ".join(all_errors)
                 )
             elif user_analysis_failures:
                 check_status = "warning"
                 check_message = (
-                    f"{len(sources)} edição(ões) extra(s) coletada(s), mas houve "
-                    f"{user_analysis_failures} falha(s) de análise personalizada por usuário. "
+                    f"{len(sources)} edição(ões) extra(s) coletada(s) para {dates_label}, "
+                    f"mas houve {user_analysis_failures} falha(s) de análise personalizada. "
                     "As contas afetadas poderão tentar novamente ao abrir a edição."
                 )
             else:
                 check_status = "success"
                 check_message = (
-                    f"Verificação concluída: {len(sources)} edição(ões) extra(s) da Parte II "
-                    "identificada(s), processada(s) e analisada(s) para as contas com temas cadastrados."
+                    f"Verificação concluída para {dates_label}: {len(sources)} edição(ões) "
+                    "extra(s) da Parte II identificada(s), processada(s) e analisada(s) "
+                    "para as contas com temas cadastrados."
                 )
+
             db_post("ingestion_runs", {
                 "status": check_status,
                 "edition_date": today,
                 "edition_type": "extra",
+                "started_at": check_started_at.isoformat(),
                 "message": check_message,
                 "publications_found": 0,
                 "publications_relevant": 0,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
+
             if user_analysis_failures:
-                failures.append(f"extra: {user_analysis_failures} análise(s) personalizada(s) falharam")
+                failures.append(
+                    f"extra: {user_analysis_failures} análise(s) personalizada(s) falharam"
+                )
+
     if failures:
         raise RuntimeError("Uma ou mais coletas falharam: " + " | ".join(failures))
 
