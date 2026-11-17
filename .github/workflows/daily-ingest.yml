@@ -1,17 +1,12 @@
 name: Radar ALERJ — coleta e verificação de edições
 
 on:
-  schedule:
-    # Coleta da edição regular, todos os dias às 9h05 de Brasília.
-    - cron: '5 9 * * *'
-      timezone: 'America/Sao_Paulo'
-    # Segunda checagem diária para identificar uma eventual edição extra.
-    - cron: '0 22 * * *'
-      timezone: 'America/Sao_Paulo'
+  # O agendamento passa a ser controlado pelo Supabase Cron.
+  # O Supabase dispara este workflow via workflow_dispatch nos horários locais definidos.
   workflow_dispatch:
     inputs:
       scan_mode:
-        description: 'Tipo de edição a verificar manualmente'
+        description: 'Tipo de edição a verificar'
         required: true
         type: choice
         options:
@@ -35,6 +30,18 @@ jobs:
     steps:
       - name: Baixar código
         uses: actions/checkout@v7
+
+      - name: Diagnóstico do disparo e dos fusos
+        env:
+          RADAR_EVENT_NAME: ${{ github.event_name }}
+          RADAR_SCAN_MODE: ${{ inputs.scan_mode || 'both' }}
+        run: |
+          echo "Evento: ${RADAR_EVENT_NAME}"
+          echo "Modo solicitado: ${RADAR_SCAN_MODE}"
+          echo "Horário UTC: $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Horário de Brasília: $(TZ=America/Sao_Paulo date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "GitHub Run ID: ${{ github.run_id }}"
+          echo "Branch: ${{ github.ref }}"
 
       - name: Preparar Python
         uses: actions/setup-python@v7
@@ -60,5 +67,5 @@ jobs:
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
-          EDITION_SCAN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.scan_mode || (github.event.schedule == '0 22 * * *' && 'extra' || 'regular') }}
+          EDITION_SCAN_MODE: ${{ inputs.scan_mode || 'both' }}
         run: python worker/ingest.py
