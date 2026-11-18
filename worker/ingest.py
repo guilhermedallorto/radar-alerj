@@ -33,6 +33,11 @@ LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima
 SELECT_DATE = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_seleciona_data.php"
 TZ = "America/Sao_Paulo"
 MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+
+# Intervalo mínimo global entre chamadas ao Gemini.
+# Corresponde a, no máximo, 12 requisições por minuto.
+GEMINI_INTERVAL_SECONDS = 5.0
+
 CHUNK_LIMIT = 14500
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -610,6 +615,7 @@ def validate_part_ii_pdf(pdf_bytes: bytes, expected_date: str | None = None) -> 
     finally:
         doc.close()
 
+
 def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
     """Extrai o texto por coluna, na ordem de leitura do Diário Oficial.
 
@@ -767,7 +773,9 @@ def log_run(
         db_post("ingestion_runs", {"status": status, **payload})
 
 
-def reserve_gemini_slot(interval_seconds: float = 6.0) -> None:
+def reserve_gemini_slot(
+    interval_seconds: float = GEMINI_INTERVAL_SECONDS
+) -> None:
     """
     Reserva um intervalo global entre chamadas ao Gemini.
 
@@ -789,6 +797,7 @@ def reserve_gemini_slot(interval_seconds: float = 6.0) -> None:
             f"no Supabase ({response.status_code}): {response.text[:1000]}"
         )
 
+
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
     """Solicita JSON ao Gemini, respeitando o limitador global e tratando 429/503."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
@@ -806,7 +815,9 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
 
     for attempt in range(1, max_attempts + 1):
         # Todas as execuções que utilizam este banco compartilham o mesmo controle.
-        reserve_gemini_slot(interval_seconds=6.0)
+        reserve_gemini_slot(
+            interval_seconds=GEMINI_INTERVAL_SECONDS
+        )
 
         try:
             response = requests.post(
@@ -1026,6 +1037,7 @@ PUBLICAÇÕES:
         "Consulte os registros individuais para examinar os atos publicados."
     )
 
+
 def db_get_all(table: str, params: dict[str, str], page_size: int = 1000) -> list[dict[str, Any]]:
     """Lê todas as páginas de uma tabela REST sem depender do limite padrão do Supabase."""
     collected: list[dict[str, Any]] = []
@@ -1066,6 +1078,91 @@ def user_theme_signature(themes: list[dict[str, Any]], publications: list[dict[s
         "publications": [[p.get("id"), p.get("updated_at") or ""] for p in ordered_publications],
     }
     serialized = json.dumps(signature_source, ensure_ascii=False, separators=(",", ":"))
+    return sha256(serialized)
+
+
+def user_theme_cache_signature(themes: list[dict[str, Any]]) -> str:
+    """
+    Gera uma assinatura exclusiva dos temas ativos do usuário.
+
+    Não inclui as publicações. Assim, a entrada de uma publicação nova
+    não invalida o cache das demais.
+    """
+    active_themes = sorted(
+        [theme for theme in themes if theme.get("active")],
+        key=lambda t: clean_str(t.get("id")),
+    )
+
+    signature_source = {
+        "themes": [
+            {
+                "id": t.get("id"),
+                "name": t.get("name"),
+                "description": t.get("description") or "",
+                "keywords": t.get("keywords") or [],
+                "include_criteria": t.get("include_criteria") or "",
+                "exclude_criteria": t.get("exclude_criteria") or "",
+                "priority": int(t.get("priority") or 3),
+                "updated_at": t.get("updated_at"),
+            }
+            for t in active_themes
+        ]
+    }
+
+    serialized = json.dumps(
+        signature_source,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    return sha256(serialized)
+
+
+def compact_publication_for_analysis(
+    publication: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Prepara a representação da publicação enviada ao Gemini.
+
+    A mesma representação é utilizada para gerar a assinatura individual
+    e para compor o prompt, evitando divergências entre o cache e a análise.
+    """
+    return {
+        "publication_id": publication.get("id"),
+        "type": publication.get("kind"),
+        "title": publication.get("title"),
+        "organization": publication.get("organization"),
+        "page_start": publication.get("page_start"),
+        "page_end": publication.get("page_end"),
+        "text": re.sub(
+            r"\s+",
+            " ",
+            clean_str(publication.get("body_text")),
+        )[:2600],
+    }
+
+
+def user_publication_cache_signature(
+    theme_cache_signature: str,
+    publication: dict[str, Any],
+) -> str:
+    """
+    Gera uma assinatura individual para cada publicação.
+
+    O resultado depende dos temas ativos e do conteúdo efetivamente
+    enviado ao Gemini para classificar aquela publicação.
+    """
+    signature_source = {
+        "theme_signature": theme_cache_signature,
+        "publication": compact_publication_for_analysis(publication),
+    }
+
+    serialized = json.dumps(
+        signature_source,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
     return sha256(serialized)
 
 
@@ -1197,8 +1294,8 @@ def analyze_edition_for_users(
 
             analysis_started = True
 
-            # Inclui theme_signature para identificar os lotes que já foram
-            # classificados na tentativa anterior.
+            # Inclui theme_signature para identificar as publicações
+            # que já foram classificadas na tentativa anterior.
             previous_rows = db_get_all("user_publication_matches", {
                 "select": (
                     "publication_id,theme_signature,relevant,matched_themes,"
@@ -1275,8 +1372,26 @@ def analyze_edition_for_users(
                 theme["name"] for theme in themes_for_prompt
             }
 
+            # A assinatura do conjunto de temas é separada da assinatura geral
+            # da edição. Assim, uma publicação nova não invalida o cache das antigas.
+            theme_cache_signature = user_theme_cache_signature(
+                user_themes_all
+            )
+
+            # Calcula uma assinatura independente para cada publicação.
+            publication_signatures = {
+                clean_str(publication.get("id")):
+                    user_publication_cache_signature(
+                        theme_cache_signature,
+                        publication,
+                    )
+                for publication in publications
+            }
+
             classified_rows: list[dict[str, Any]] = []
-            batch_size = 10
+
+            # Aumenta de 10 para 15 publicações por requisição.
+            batch_size = 15
 
             total_batches = (
                 (len(publications) + batch_size - 1) // batch_size
@@ -1288,21 +1403,26 @@ def analyze_edition_for_users(
                 cached_rows: list[dict[str, Any]] = []
                 publications_to_classify: list[dict[str, Any]] = []
 
-                # Reaproveita os resultados de lotes já gravados com a
-                # mesma assinatura de temas e publicações.
+                # Reaproveita individualmente os resultados já gravados,
+                # desde que os temas e o conteúdo da publicação não tenham mudado.
                 for publication in batch:
                     publication_id = clean_str(publication.get("id"))
                     previous = previous_by_publication.get(publication_id)
 
+                    current_publication_signature = publication_signatures.get(
+                        publication_id
+                    )
+
                     if (
                         previous
-                        and previous.get("theme_signature") == theme_signature
+                        and current_publication_signature
+                        and previous.get("theme_signature") == current_publication_signature
                     ):
                         cached_rows.append({
                             "user_id": user_id,
                             "edition_id": edition_id,
                             "publication_id": publication_id,
-                            "theme_signature": theme_signature,
+                            "theme_signature": current_publication_signature,
                             "relevant": bool(previous.get("relevant")),
                             "matched_themes": previous.get("matched_themes") or [],
                             "confidence": previous.get("confidence"),
@@ -1318,23 +1438,11 @@ def analyze_edition_for_users(
                 new_rows: list[dict[str, Any]] = []
 
                 # Só chama o Gemini para publicações que ainda não tenham
-                # sido classificadas com a assinatura atual.
+                # sido classificadas com a assinatura individual atual.
                 if publications_to_classify:
                     compact = [
-                        {
-                            "publication_id": p.get("id"),
-                            "type": p.get("kind"),
-                            "title": p.get("title"),
-                            "organization": p.get("organization"),
-                            "page_start": p.get("page_start"),
-                            "page_end": p.get("page_end"),
-                            "text": re.sub(
-                                r"\s+",
-                                " ",
-                                clean_str(p.get("body_text")),
-                            )[:2600],
-                        }
-                        for p in publications_to_classify
+                        compact_publication_for_analysis(publication)
+                        for publication in publications_to_classify
                     ]
 
                     prompt = f"""Você é um analista documental de um gabinete parlamentar. Classifique cada publicação exclusivamente em relação aos temas particulares deste usuário.
@@ -1442,7 +1550,7 @@ Responda somente JSON no formato {{"items":[{{"publication_id":"UUID","relevant"
                             "user_id": user_id,
                             "edition_id": edition_id,
                             "publication_id": publication_id,
-                            "theme_signature": theme_signature,
+                            "theme_signature": publication_signatures[publication_id],
                             "relevant": relevant,
                             "matched_themes": matched if relevant else [],
                             "confidence": confidence,
@@ -1479,9 +1587,6 @@ Responda somente JSON no formato {{"items":[{{"publication_id":"UUID","relevant"
                     f"{len(cached_rows)} reaproveitada(s), "
                     f"{len(new_rows)} nova(s)."
                 )
-
-                if offset + batch_size < len(publications):
-                    time.sleep(1.2)
 
             relevant_rows = [
                 row for row in classified_rows
@@ -1612,7 +1717,7 @@ def process_analysis_queue() -> None:
     - queued: aguardando processamento;
     - processing: em andamento;
     - processed: concluída;
-    - error: falhou e aguarda nova solicitação.
+    - error: falhou e aguarda nova tentativa.
 
     Tarefas que ficaram presas em processing por mais de 20 minutos
     são recuperadas automaticamente.
@@ -1871,8 +1976,8 @@ def process_source(source: dict[str, Any]) -> None:
         for number, chunk in enumerate(chunks, start=1):
             print(f"Segmentando lote {number}/{len(chunks)} (páginas {chunk['start_page']}–{chunk['end_page']}).")
             all_items.extend(classify_chunk(chunk, edition_date))
-            if number < len(chunks):
-                time.sleep(7.0)
+            # O intervalo entre chamadas já é controlado globalmente
+            # por reserve_gemini_slot(); não é necessária outra pausa aqui.
 
         deduped: dict[str, dict[str, Any]] = {}
         for item in all_items:
@@ -2017,6 +2122,7 @@ def process_source(source: dict[str, Any]) -> None:
         except Exception as log_exc:
             print(f"Também não foi possível registrar a falha no banco: {log_exc}", file=sys.stderr)
         raise
+
 
 def process() -> None:
     mode = os.getenv("EDITION_SCAN_MODE", "regular").strip().lower()
