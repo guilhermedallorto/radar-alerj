@@ -1,3 +1,4 @@
+
 (() => {
   const cfg = window.RADAR_CONFIG || {};
   const $ = (id) => document.getElementById(id);
@@ -579,9 +580,8 @@
     $('daily-summary').textContent =
       'O Radar está solicitando a análise personalizada desta edição.';
 
-    // A Edge Function agora apenas registra a solicitação na fila e aciona
-    // o workflow do GitHub Actions. A classificação propriamente dita é
-    // realizada pelo worker Python, fora do limite de execução da Edge Function.
+    // A Edge Function registra a solicitação na fila e aciona
+    // o workflow do GitHub Actions.
     try {
       const {
         data: analysisResponse,
@@ -610,8 +610,7 @@
         analysisError.message || String(analysisError);
     }
 
-    // Consulta o estado persistido no Supabase, independentemente de a
-    // solicitação à Edge Function ter retornado sucesso ou erro.
+    // Consulta o estado persistido no Supabase.
     try {
       await refreshEditionAnalysis(id);
     } catch (refreshError) {
@@ -942,6 +941,7 @@
             <div class="theme-actions">
               <button data-edit-theme="${esc(t.id)}">Editar</button>
               <button data-toggle-theme="${esc(t.id)}">${t.active ? 'Desativar' : 'Ativar'}</button>
+              <button data-delete-theme="${esc(t.id)}">Excluir</button>
             </div>
           </article>
         `).join('')
@@ -987,6 +987,11 @@
       .select('*')
       .order('priority');
 
+    if (refreshed.error) {
+      toast(`O tema foi salvo, mas não foi possível atualizar a lista: ${refreshed.error.message}`);
+      return;
+    }
+
     themes = refreshed.data || [];
 
     clearThemeForm();
@@ -1026,7 +1031,8 @@
 
     const { error } = await client.from('themes')
       .update({ active:!t.active })
-      .eq('id',id);
+      .eq('id',id)
+      .eq('user_id',currentUser.id);
 
     if (error) {
       toast(error.message);
@@ -1043,6 +1049,62 @@
     }
 
     toast(`Tema ${t.active ? 'ativado' : 'desativado'}.`);
+  }
+
+  // Exclui definitivamente um tema da conta do usuário.
+  async function deleteTheme(id) {
+    const t = themes.find(x => x.id === id);
+    if (!t) return;
+
+    const confirmed = window.confirm(
+      `Tem certeza de que deseja excluir o tema "${t.name}"?\n\n` +
+      'Essa operação não poderá ser desfeita. O tema deixará de ser considerado nas próximas análises.'
+    );
+
+    if (!confirmed) return;
+
+    try {
+      const { error } = await client.from('themes')
+        .delete()
+        .eq('id', id)
+        .eq('user_id', currentUser.id);
+
+      if (error) {
+        throw error;
+      }
+
+      // Remove o tema da lista local.
+      themes = themes.filter(x => x.id !== id);
+
+      // Se o tema excluído estava sendo editado, limpa o formulário.
+      if ($('theme-id').value === id) {
+        clearThemeForm();
+      }
+
+      // Se o usuário estava visualizando publicações filtradas por esse tema,
+      // remove também o filtro.
+      if (selectedTheme === t.name) {
+        selectedTheme = '';
+      }
+
+      renderThemes();
+      renderTopicRow();
+
+      // Solicita nova análise da edição atual considerando os temas restantes.
+      if (currentEdition) {
+        await selectEdition(currentEdition.id);
+      }
+
+      // Atualiza também a tela do acervo, caso esteja aberta.
+      if (currentView === 'publications') {
+        await loadPublications(false);
+      }
+
+      toast(`Tema "${t.name}" excluído com sucesso.`);
+    } catch (error) {
+      console.error('Erro ao excluir tema:', error);
+      toast(`Não foi possível excluir o tema: ${error.message || error}`);
+    }
   }
 
   // ------------------------------------------------------------
@@ -1357,6 +1419,14 @@
 
     if (toggle) {
       await toggleTheme(toggle.dataset.toggleTheme);
+      return;
+    }
+
+    // Novo evento: exclusão de tema monitorado.
+    const remove = event.target.closest('[data-delete-theme]');
+
+    if (remove) {
+      await deleteTheme(remove.dataset.deleteTheme);
       return;
     }
 
