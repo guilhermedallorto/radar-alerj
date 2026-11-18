@@ -1,0 +1,45 @@
+name: Radar ALERJ — análise temática em fila
+
+on:
+  workflow_dispatch:
+
+  # Verificação periódica para recuperar tarefas que tenham ficado
+  # em processamento caso uma execução anterior tenha sido interrompida.
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: read
+
+# Apenas um worker de análise pode processar a fila de cada vez.
+concurrency:
+  group: radar-alerj-analysis-queue
+  cancel-in-progress: false
+
+jobs:
+  process-analysis-queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Baixar código
+        uses: actions/checkout@v7
+
+      - name: Preparar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Instalar dependências Python
+        run: pip install -r worker/requirements.txt
+
+      - name: Processar análises pendentes
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          EDITION_SCAN_MODE: analysis
+        run: python worker/ingest.py
