@@ -767,9 +767,32 @@ def log_run(
         db_post("ingestion_runs", {"status": status, **payload})
 
 
+def reserve_gemini_slot(interval_seconds: float = 6.0) -> None:
+    """
+    Reserva um intervalo global entre chamadas ao Gemini.
+
+    O controle fica no PostgreSQL, e não apenas na memória deste processo.
+    Assim, execuções diferentes do GitHub Actions respeitam o mesmo intervalo.
+    """
+    endpoint = f"{SUPABASE_URL}/rest/v1/rpc/reserve_gemini_slot"
+
+    response = requests.post(
+        endpoint,
+        headers=supabase_headers(),
+        json={"p_interval_seconds": interval_seconds},
+        timeout=(10, 90),
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            "Não foi possível reservar um intervalo para a API Gemini "
+            f"no Supabase ({response.status_code}): {response.text[:1000]}"
+        )
+
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
-    """Solicita JSON ao Gemini com backoff para 429/503 e falhas de rede/timeout."""
+    """Solicita JSON ao Gemini, respeitando o limitador global e tratando 429/503."""
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -777,78 +800,141 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
             "maxOutputTokens": max_output_tokens,
         },
     }
+
     response = None
     max_attempts = 6
+
     for attempt in range(1, max_attempts + 1):
+        # Todas as execuções que utilizam este banco compartilham o mesmo controle.
+        reserve_gemini_slot(interval_seconds=6.0)
+
         try:
             response = requests.post(
                 endpoint,
-                headers={"x-goog-api-key": GEMINI_KEY, "Content-Type": "application/json"},
+                headers={
+                    "x-goog-api-key": GEMINI_KEY,
+                    "Content-Type": "application/json",
+                },
                 json=payload,
                 timeout=(25, 120),
             )
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
             if attempt >= max_attempts:
                 raise RuntimeError(
-                    f"Gemini não respondeu após {max_attempts} tentativas; última falha de rede/timeout: {exc}"
+                    f"Gemini não respondeu após {max_attempts} tentativas; "
+                    f"última falha de rede/timeout: {exc}"
                 ) from exc
+
             wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
+
             print(
-                f"Gemini sem resposta ({type(exc).__name__}); tentativa {attempt}/{max_attempts}. "
+                f"Gemini sem resposta ({type(exc).__name__}); "
+                f"tentativa {attempt}/{max_attempts}. "
                 f"Nova tentativa em {wait_seconds}s."
             )
+
             time.sleep(wait_seconds)
             continue
 
         if response.ok:
             break
+
         if response.status_code not in (429, 500, 502, 503, 504) or attempt >= max_attempts:
             raise RuntimeError(
-                f"Gemini API retornou HTTP {response.status_code} após {attempt} tentativa(s): {response.text[:1500]}"
+                f"Gemini API retornou HTTP {response.status_code} "
+                f"após {attempt} tentativa(s): {response.text[:1500]}"
             )
 
+        # Respeita primeiro o Retry-After do HTTP.
         retry_after = response.headers.get("Retry-After", "")
+
         try:
             wait_seconds = float(retry_after)
         except (TypeError, ValueError):
+            wait_seconds = None
+
+        # Algumas respostas do Google trazem o tempo apenas no corpo JSON:
+        # "Please retry in 33.0073285s."
+        if wait_seconds is None:
+            retry_match = re.search(
+                r"retry in\s+([\d.]+)\s*s",
+                response.text,
+                re.I,
+            )
+
+            if retry_match:
+                try:
+                    wait_seconds = float(retry_match.group(1))
+                except ValueError:
+                    wait_seconds = None
+
+        # Backoff exponencial se o Google não informar o tempo.
+        if wait_seconds is None:
             wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
-        wait_seconds = max(3, min(wait_seconds, 120))
+
+        wait_seconds = max(3, min(wait_seconds, 180))
+
         print(
             f"Gemini temporariamente indisponível (HTTP {response.status_code}); "
-            f"tentativa {attempt}/{max_attempts}, nova tentativa em {wait_seconds:.0f}s."
+            f"tentativa {attempt}/{max_attempts}, "
+            f"nova tentativa em {wait_seconds:.0f}s."
         )
+
         time.sleep(wait_seconds)
+
     else:
-        raise RuntimeError("Gemini não respondeu após todas as tentativas configuradas.")
+        raise RuntimeError(
+            "Gemini não respondeu após todas as tentativas configuradas."
+        )
 
     data = response.json()
     candidates = data.get("candidates") or []
     parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+
     output = "\n".join(
         part.get("text", "")
         for part in parts
-        if isinstance(part, dict) and isinstance(part.get("text"), str) and not part.get("thought")
+        if isinstance(part, dict)
+        and isinstance(part.get("text"), str)
+        and not part.get("thought")
     ).strip()
+
     if not output:
         feedback = data.get("promptFeedback", {}).get("blockReason")
         finish_reason = candidates[0].get("finishReason") if candidates else None
+
         raise RuntimeError(
             "Gemini não devolveu texto utilizável. "
-            f"Motivo de bloqueio: {feedback or 'não informado'}; conclusão: {finish_reason or 'sem candidato'}."
+            f"Motivo de bloqueio: {feedback or 'não informado'}; "
+            f"conclusão: {finish_reason or 'sem candidato'}."
         )
-    # O Gemini pode respeitar o schema conceitual e ainda devolver a lista
-    # diretamente, em vez do invólucro {"items": [...]}. Ambos são aceitos;
-    # cada etapa valida o formato que efetivamente espera.
+
     candidate_json = output.strip()
+
     if candidate_json.startswith("```"):
-        candidate_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate_json, flags=re.I).strip()
+        candidate_json = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            candidate_json,
+            flags=re.I,
+        ).strip()
+
     try:
         parsed = json.loads(candidate_json)
+
         if not isinstance(parsed, (dict, list)):
             raise ValueError("A resposta JSON deve ser um objeto ou uma lista.")
+
         return parsed
+
     except Exception as exc:
-        raise RuntimeError(f"O Gemini não devolveu JSON válido: {output[:800]}") from exc
+        raise RuntimeError(
+            f"O Gemini não devolveu JSON válido: {output[:800]}"
+        ) from exc
 
 
 def classify_chunk(chunk: dict[str, Any], edition_date: str) -> list[dict[str, Any]]:
@@ -983,51 +1069,111 @@ def user_theme_signature(themes: list[dict[str, Any]], publications: list[dict[s
     return sha256(serialized)
 
 
-def analyze_edition_for_users(edition_id: str, edition_date: str, edition_label: str) -> dict[str, int]:
-    """Pré-calcula os destaques de uma edição extra separadamente para cada usuário com temas."""
+def analyze_edition_for_users(
+    edition_id: str,
+    edition_date: str,
+    edition_label: str,
+    only_user_id: str | None = None,
+) -> dict[str, int]:
+    """
+    Analisa os destaques de uma edição separadamente para cada usuário.
+
+    Quando only_user_id é informado, processa somente aquela conta.
+    Cada lote concluído é salvo imediatamente, permitindo retomar a análise
+    sem repetir chamadas ao Gemini que já foram concluídas.
+    """
+
     themes_all = db_get_all("themes", {
-        "select": "id,user_id,name,description,keywords,include_criteria,exclude_criteria,priority,active,updated_at",
+        "select": (
+            "id,user_id,name,description,keywords,include_criteria,"
+            "exclude_criteria,priority,active,updated_at"
+        ),
         "order": "user_id.asc,priority.asc,name.asc,id.asc",
     })
+
     themes_by_user: dict[str, list[dict[str, Any]]] = {}
-    for theme in themes_all:
-        user_id = clean_str(theme.get("user_id"))
-        if user_id:
-            themes_by_user.setdefault(user_id, []).append(theme)
+
+    if only_user_id:
+        # Mesmo que o usuário ainda não tenha cadastrado temas,
+        # criamos a entrada para que a análise seja finalizada corretamente.
+        themes_by_user[only_user_id] = [
+            theme for theme in themes_all
+            if clean_str(theme.get("user_id")) == only_user_id
+        ]
+    else:
+        for theme in themes_all:
+            user_id = clean_str(theme.get("user_id"))
+            if user_id:
+                themes_by_user.setdefault(user_id, []).append(theme)
 
     if not themes_by_user:
-        print("Análise temática noturna: não há usuários com temas cadastrados; a análise será feita quando uma conta configurar temas.")
+        print(
+            "Análise temática: não há usuários com temas cadastrados; "
+            "nenhuma análise personalizada precisa ser executada."
+        )
         return {"users": 0, "processed": 0, "failed": 0}
 
     publications = db_get_all("publications", {
-        "select": "id,edition_id,page_start,page_end,kind,title,body_text,organization,people,municipalities,amounts,updated_at",
+        "select": (
+            "id,edition_id,page_start,page_end,kind,title,body_text,"
+            "organization,people,municipalities,amounts,updated_at"
+        ),
         "edition_id": f"eq.{edition_id}",
         "order": "page_start.asc,id.asc",
     })
-    results = {"users": len(themes_by_user), "processed": 0, "failed": 0}
 
-    for user_number, (user_id, user_themes_all) in enumerate(themes_by_user.items(), start=1):
+    results = {
+        "users": len(themes_by_user),
+        "processed": 0,
+        "failed": 0,
+    }
+
+    for user_number, (user_id, user_themes_all) in enumerate(
+        themes_by_user.items(),
+        start=1,
+    ):
         analysis_started = False
         theme_signature = ""
+
         try:
             active_themes = sorted(
                 [theme for theme in user_themes_all if theme.get("active")],
-                key=lambda t: (int(t.get("priority") or 3), clean_str(t.get("name")), clean_str(t.get("id"))),
+                key=lambda t: (
+                    int(t.get("priority") or 3),
+                    clean_str(t.get("name")),
+                    clean_str(t.get("id")),
+                ),
             )
-            theme_signature = user_theme_signature(user_themes_all, publications)
+
+            theme_signature = user_theme_signature(
+                user_themes_all,
+                publications,
+            )
+
             prior_rows = db_get("user_edition_analyses", {
-                "select": "id,status,theme_signature,publication_count,relevant_count,summary",
+                "select": (
+                    "id,status,theme_signature,publication_count,"
+                    "relevant_count,summary"
+                ),
                 "user_id": f"eq.{user_id}",
                 "edition_id": f"eq.{edition_id}",
                 "limit": "1",
             })
+
             prior = prior_rows[0] if prior_rows else None
+
+            # Uma análise concluída com a mesma assinatura pode ser reutilizada.
             if (
-                prior and prior.get("status") == "processed"
+                prior
+                and prior.get("status") == "processed"
                 and prior.get("theme_signature") == theme_signature
                 and int(prior.get("publication_count") or 0) == len(publications)
             ):
-                print(f"Análise personalizada já atualizada: usuário {user_id[:8]}… ({len(publications)} publicações).")
+                print(
+                    f"Análise personalizada já atualizada: "
+                    f"usuário {user_id[:8]}… "
+                    f"({len(publications)} publicações)."
+                )
                 results["processed"] += 1
                 continue
 
@@ -1042,41 +1188,73 @@ def analyze_edition_for_users(edition_id: str, edition_date: str, edition_label:
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "finished_at": None,
             }
-            db_post("user_edition_analyses", analysis_payload, on_conflict="user_id,edition_id")
+
+            db_post(
+                "user_edition_analyses",
+                analysis_payload,
+                on_conflict="user_id,edition_id",
+            )
+
             analysis_started = True
 
+            # Inclui theme_signature para identificar os lotes que já foram
+            # classificados na tentativa anterior.
             previous_rows = db_get_all("user_publication_matches", {
-                "select": "publication_id,manual_relevance,manual_note,reviewed_at,relevant,matched_themes,confidence,justification,summary",
+                "select": (
+                    "publication_id,theme_signature,relevant,matched_themes,"
+                    "confidence,justification,summary,manual_relevance,"
+                    "manual_note,reviewed_at"
+                ),
                 "user_id": f"eq.{user_id}",
                 "edition_id": f"eq.{edition_id}",
             })
-            previous_by_publication = {row.get("publication_id"): row for row in previous_rows}
 
+            previous_by_publication = {
+                row.get("publication_id"): row
+                for row in previous_rows
+            }
+
+            # Usuário sem temas ativos: conclui sem chamar o Gemini.
             if not active_themes:
-                db_patch("user_publication_matches", {
-                    "user_id": f"eq.{user_id}",
-                    "edition_id": f"eq.{edition_id}",
-                    "manual_relevance": "is.null",
-                }, {
-                    "theme_signature": theme_signature,
-                    "relevant": False,
-                    "matched_themes": [],
-                    "confidence": None,
-                    "justification": None,
-                    "summary": None,
-                })
-                summary = "Nenhum tema ativo está configurado para este usuário. Cadastre ou ative temas para receber destaques personalizados nas próximas edições."
-                db_patch("user_edition_analyses", {
-                    "user_id": f"eq.{user_id}",
-                    "edition_id": f"eq.{edition_id}",
-                }, {
-                    "status": "processed",
-                    "summary": summary,
-                    "publication_count": len(publications),
-                    "relevant_count": 0,
-                    "error": None,
-                    "finished_at": datetime.now(timezone.utc).isoformat(),
-                })
+                db_patch(
+                    "user_publication_matches",
+                    {
+                        "user_id": f"eq.{user_id}",
+                        "edition_id": f"eq.{edition_id}",
+                        "manual_relevance": "is.null",
+                    },
+                    {
+                        "theme_signature": theme_signature,
+                        "relevant": False,
+                        "matched_themes": [],
+                        "confidence": None,
+                        "justification": None,
+                        "summary": None,
+                    },
+                )
+
+                summary = (
+                    "Nenhum tema ativo está configurado para este usuário. "
+                    "Cadastre ou ative temas para receber destaques "
+                    "personalizados nas próximas edições."
+                )
+
+                db_patch(
+                    "user_edition_analyses",
+                    {
+                        "user_id": f"eq.{user_id}",
+                        "edition_id": f"eq.{edition_id}",
+                    },
+                    {
+                        "status": "processed",
+                        "summary": summary,
+                        "publication_count": len(publications),
+                        "relevant_count": 0,
+                        "error": None,
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+
                 results["processed"] += 1
                 continue
 
@@ -1092,24 +1270,74 @@ def analyze_edition_for_users(edition_id: str, edition_date: str, edition_label:
                 }
                 for t in active_themes
             ]
-            allowed_names = {t["name"] for t in themes_for_prompt}
+
+            allowed_names = {
+                theme["name"] for theme in themes_for_prompt
+            }
+
             classified_rows: list[dict[str, Any]] = []
             batch_size = 10
+
+            total_batches = (
+                (len(publications) + batch_size - 1) // batch_size
+            )
+
             for offset in range(0, len(publications), batch_size):
                 batch = publications[offset:offset + batch_size]
-                compact = [
-                    {
-                        "publication_id": p.get("id"),
-                        "type": p.get("kind"),
-                        "title": p.get("title"),
-                        "organization": p.get("organization"),
-                        "page_start": p.get("page_start"),
-                        "page_end": p.get("page_end"),
-                        "text": re.sub(r"\s+", " ", clean_str(p.get("body_text")))[:2600],
-                    }
-                    for p in batch
-                ]
-                prompt = f"""Você é um analista documental de um gabinete parlamentar. Classifique cada publicação exclusivamente em relação aos temas particulares deste usuário.
+
+                cached_rows: list[dict[str, Any]] = []
+                publications_to_classify: list[dict[str, Any]] = []
+
+                # Reaproveita os resultados de lotes já gravados com a
+                # mesma assinatura de temas e publicações.
+                for publication in batch:
+                    publication_id = clean_str(publication.get("id"))
+                    previous = previous_by_publication.get(publication_id)
+
+                    if (
+                        previous
+                        and previous.get("theme_signature") == theme_signature
+                    ):
+                        cached_rows.append({
+                            "user_id": user_id,
+                            "edition_id": edition_id,
+                            "publication_id": publication_id,
+                            "theme_signature": theme_signature,
+                            "relevant": bool(previous.get("relevant")),
+                            "matched_themes": previous.get("matched_themes") or [],
+                            "confidence": previous.get("confidence"),
+                            "justification": previous.get("justification"),
+                            "summary": previous.get("summary"),
+                            "manual_relevance": previous.get("manual_relevance"),
+                            "manual_note": previous.get("manual_note"),
+                            "reviewed_at": previous.get("reviewed_at"),
+                        })
+                    else:
+                        publications_to_classify.append(publication)
+
+                new_rows: list[dict[str, Any]] = []
+
+                # Só chama o Gemini para publicações que ainda não tenham
+                # sido classificadas com a assinatura atual.
+                if publications_to_classify:
+                    compact = [
+                        {
+                            "publication_id": p.get("id"),
+                            "type": p.get("kind"),
+                            "title": p.get("title"),
+                            "organization": p.get("organization"),
+                            "page_start": p.get("page_start"),
+                            "page_end": p.get("page_end"),
+                            "text": re.sub(
+                                r"\s+",
+                                " ",
+                                clean_str(p.get("body_text")),
+                            )[:2600],
+                        }
+                        for p in publications_to_classify
+                    ]
+
+                    prompt = f"""Você é um analista documental de um gabinete parlamentar. Classifique cada publicação exclusivamente em relação aos temas particulares deste usuário.
 
 REGRAS OBRIGATÓRIAS:
 - Avalie o conteúdo substantivo, não apenas coincidências de palavras.
@@ -1129,128 +1357,438 @@ PUBLICAÇÕES DO LOTE:
 {json.dumps(compact, ensure_ascii=False)}
 
 Responda somente JSON no formato {{"items":[{{"publication_id":"UUID","relevant":true,"matched_themes":["Tema exato"],"confidence":0.0,"justification":"...","summary":"..."}}]}}."""
-                parsed = gemini_json(prompt, 6000)
-                if isinstance(parsed, list):
-                    items = parsed
-                elif isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
-                    items = parsed["items"]
-                else:
-                    raise RuntimeError("O Gemini não retornou uma lista JSON de classificações.")
 
-                by_id: dict[str, dict[str, Any]] = {}
-                valid_ids = {clean_str(p.get("id")) for p in batch}
-                for item in items:
-                    if not isinstance(item, dict):
-                        raise RuntimeError("O Gemini retornou item de classificação em formato inválido.")
-                    publication_id = clean_str(item.get("publication_id"))
-                    if not publication_id or publication_id not in valid_ids or publication_id in by_id:
-                        raise RuntimeError("O Gemini retornou identificador ausente, repetido ou estranho ao lote.")
-                    by_id[publication_id] = item
-                for publication in batch:
-                    publication_id = clean_str(publication.get("id"))
-                    item = by_id.get(publication_id)
-                    if item is None:
-                        raise RuntimeError(f"O Gemini não classificou a publicação {publication_id}.")
-                    matched = item.get("matched_themes") if isinstance(item.get("matched_themes"), list) else []
-                    matched = list(dict.fromkeys(str(value) for value in matched if str(value) in allowed_names))
-                    relevant = bool(item.get("relevant")) and bool(matched)
-                    previous = previous_by_publication.get(publication_id) or {}
-                    try:
-                        confidence = float(item.get("confidence")) if item.get("confidence") is not None else None
-                        if confidence is not None and not 0 <= confidence <= 1:
-                            confidence = max(0.0, min(1.0, confidence))
-                    except (TypeError, ValueError):
-                        confidence = None
-                    classified_rows.append({
-                        "user_id": user_id,
-                        "edition_id": edition_id,
-                        "publication_id": publication_id,
-                        "theme_signature": theme_signature,
-                        "relevant": relevant,
-                        "matched_themes": matched if relevant else [],
-                        "confidence": confidence,
-                        "justification": clean_str(item.get("justification"), "")[:1000] or None if relevant else None,
-                        "summary": clean_str(item.get("summary"), "")[:1800] or None if relevant else None,
-                        "manual_relevance": previous.get("manual_relevance"),
-                        "manual_note": previous.get("manual_note"),
-                        "reviewed_at": previous.get("reviewed_at"),
-                    })
+                    parsed = gemini_json(prompt, 6000)
+
+                    if isinstance(parsed, list):
+                        items = parsed
+                    elif (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("items"), list)
+                    ):
+                        items = parsed["items"]
+                    else:
+                        raise RuntimeError(
+                            "O Gemini não retornou uma lista JSON de classificações."
+                        )
+
+                    by_id: dict[str, dict[str, Any]] = {}
+
+                    valid_ids = {
+                        clean_str(p.get("id"))
+                        for p in publications_to_classify
+                    }
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            raise RuntimeError(
+                                "O Gemini retornou item de classificação "
+                                "em formato inválido."
+                            )
+
+                        publication_id = clean_str(item.get("publication_id"))
+
+                        if (
+                            not publication_id
+                            or publication_id not in valid_ids
+                            or publication_id in by_id
+                        ):
+                            raise RuntimeError(
+                                "O Gemini retornou identificador ausente, "
+                                "repetido ou estranho ao lote."
+                            )
+
+                        by_id[publication_id] = item
+
+                    for publication in publications_to_classify:
+                        publication_id = clean_str(publication.get("id"))
+                        item = by_id.get(publication_id)
+
+                        if item is None:
+                            raise RuntimeError(
+                                f"O Gemini não classificou a publicação "
+                                f"{publication_id}."
+                            )
+
+                        matched = (
+                            item.get("matched_themes")
+                            if isinstance(item.get("matched_themes"), list)
+                            else []
+                        )
+
+                        matched = list(dict.fromkeys(
+                            str(value)
+                            for value in matched
+                            if str(value) in allowed_names
+                        ))
+
+                        relevant = bool(item.get("relevant")) and bool(matched)
+                        previous = previous_by_publication.get(publication_id) or {}
+
+                        try:
+                            confidence = (
+                                float(item.get("confidence"))
+                                if item.get("confidence") is not None
+                                else None
+                            )
+
+                            if confidence is not None and not 0 <= confidence <= 1:
+                                confidence = max(0.0, min(1.0, confidence))
+
+                        except (TypeError, ValueError):
+                            confidence = None
+
+                        new_rows.append({
+                            "user_id": user_id,
+                            "edition_id": edition_id,
+                            "publication_id": publication_id,
+                            "theme_signature": theme_signature,
+                            "relevant": relevant,
+                            "matched_themes": matched if relevant else [],
+                            "confidence": confidence,
+                            "justification": (
+                                clean_str(item.get("justification"), "")[:1000] or None
+                                if relevant else None
+                            ),
+                            "summary": (
+                                clean_str(item.get("summary"), "")[:1800] or None
+                                if relevant else None
+                            ),
+                            "manual_relevance": previous.get("manual_relevance"),
+                            "manual_note": previous.get("manual_note"),
+                            "reviewed_at": previous.get("reviewed_at"),
+                        })
+
+                    # Checkpoint: grava o lote assim que ele termina.
+                    # Se o processo parar depois, este lote não será repetido.
+                    if new_rows:
+                        db_post(
+                            "user_publication_matches",
+                            new_rows,
+                            on_conflict="user_id,publication_id",
+                        )
+
+                classified_rows.extend(cached_rows)
+                classified_rows.extend(new_rows)
+
+                batch_number = offset // batch_size + 1
+
+                print(
+                    f"Análise personalizada do usuário {user_id[:8]}…: "
+                    f"lote {batch_number}/{total_batches}; "
+                    f"{len(cached_rows)} reaproveitada(s), "
+                    f"{len(new_rows)} nova(s)."
+                )
+
                 if offset + batch_size < len(publications):
                     time.sleep(1.2)
 
-            for offset in range(0, len(classified_rows), 100):
-                db_post(
-                    "user_publication_matches",
-                    classified_rows[offset:offset + 100],
-                    on_conflict="user_id,publication_id",
-                )
+            relevant_rows = [
+                row for row in classified_rows
+                if row["relevant"]
+            ]
 
-            relevant_rows = [row for row in classified_rows if row["relevant"]]
             summary = ""
+
             if relevant_rows:
-                publication_by_id = {clean_str(p.get("id")): p for p in publications}
+                publication_by_id = {
+                    clean_str(p.get("id")): p
+                    for p in publications
+                }
+
                 highlights = []
+
                 for row in relevant_rows[:35]:
-                    publication = publication_by_id.get(row["publication_id"], {})
+                    publication = publication_by_id.get(
+                        row["publication_id"],
+                        {},
+                    )
+
                     highlights.append({
                         "title": publication.get("title"),
                         "kind": publication.get("kind"),
                         "themes": row["matched_themes"],
                         "summary": row["summary"],
                     })
+
                 summary_prompt = f"""Elabore uma síntese personalizada da edição {edition_date} ({edition_label}) do Diário Oficial, Parte II — Poder Legislativo, para este usuário, considerando exclusivamente os temas e correspondências abaixo. Indique os assuntos que mais aparecem, sem inventar fatos. Escreva um único parágrafo institucional de 90 a 150 palavras.
 
 TEMAS DO USUÁRIO: {json.dumps([t['name'] for t in themes_for_prompt], ensure_ascii=False)}
 
 DESTAQUES: {json.dumps(highlights, ensure_ascii=False)}"""
+
                 try:
                     summary_parsed = gemini_json(summary_prompt, 1200)
+
                     if isinstance(summary_parsed, dict):
-                        summary = clean_str(summary_parsed.get("summary"))[:2600]
+                        summary = clean_str(
+                            summary_parsed.get("summary")
+                        )[:2600]
+
                 except Exception as summary_error:
-                    print(f"Síntese personalizada não gerada para usuário {user_id[:8]}…: {summary_error}")
+                    print(
+                        f"Síntese personalizada não gerada para usuário "
+                        f"{user_id[:8]}…: {summary_error}"
+                    )
+
             if not summary:
                 summary = (
-                    f"Foram identificadas {len(relevant_rows)} publicações relacionadas aos seus temas nesta edição, "
-                    f"entre {len(publications)} publicações analisadas. Consulte os destaques para ver os temas e resumos individuais."
-                    if relevant_rows else
-                    f"Foram analisadas {len(publications)} publicações. Nenhuma apresentou correspondência suficientemente clara com os seus temas ativos nesta edição."
+                    f"Foram identificadas {len(relevant_rows)} publicações "
+                    f"relacionadas aos seus temas nesta edição, entre "
+                    f"{len(publications)} publicações analisadas. "
+                    "Consulte os destaques para ver os temas e resumos individuais."
+                    if relevant_rows
+                    else
+                    f"Foram analisadas {len(publications)} publicações. "
+                    "Nenhuma apresentou correspondência suficientemente clara "
+                    "com os seus temas ativos nesta edição."
                 )
 
-            db_patch("user_edition_analyses", {
-                "user_id": f"eq.{user_id}",
-                "edition_id": f"eq.{edition_id}",
-            }, {
-                "status": "processed",
-                "summary": summary,
-                "publication_count": len(publications),
-                "relevant_count": len(relevant_rows),
-                "error": None,
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-            results["processed"] += 1
-            print(
-                f"Análise personalizada concluída para conta {user_number}/{len(themes_by_user)}: "
-                f"{len(relevant_rows)} destaques em {len(publications)} publicações."
+            db_patch(
+                "user_edition_analyses",
+                {
+                    "user_id": f"eq.{user_id}",
+                    "edition_id": f"eq.{edition_id}",
+                },
+                {
+                    "status": "processed",
+                    "summary": summary,
+                    "publication_count": len(publications),
+                    "relevant_count": len(relevant_rows),
+                    "error": None,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
+
+            results["processed"] += 1
+
+            print(
+                f"Análise personalizada concluída para conta "
+                f"{user_number}/{len(themes_by_user)}: "
+                f"{len(relevant_rows)} destaques em "
+                f"{len(publications)} publicações."
+            )
+
         except Exception as user_error:
             results["failed"] += 1
             message = clean_str(user_error)[:1800]
-            print(f"Falha na análise personalizada para conta {user_number}/{len(themes_by_user)}: {message}", file=sys.stderr)
+
+            print(
+                f"Falha na análise personalizada para conta "
+                f"{user_number}/{len(themes_by_user)}: {message}",
+                file=sys.stderr,
+            )
+
             if analysis_started and theme_signature:
                 try:
-                    db_patch("user_edition_analyses", {
-                        "user_id": f"eq.{user_id}",
-                        "edition_id": f"eq.{edition_id}",
-                    }, {
-                        "status": "error",
-                        "error": message,
-                        "finished_at": datetime.now(timezone.utc).isoformat(),
-                    })
+                    db_patch(
+                        "user_edition_analyses",
+                        {
+                            "user_id": f"eq.{user_id}",
+                            "edition_id": f"eq.{edition_id}",
+                        },
+                        {
+                            "status": "error",
+                            "error": message,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+
                 except Exception as status_error:
-                    print(f"Não foi possível registrar o erro da análise do usuário: {status_error}", file=sys.stderr)
+                    print(
+                        "Não foi possível registrar o erro da análise "
+                        f"do usuário: {status_error}",
+                        file=sys.stderr,
+                    )
 
     return results
+
+
+def process_analysis_queue() -> None:
+    """
+    Processa tarefas da tabela user_edition_analyses.
+
+    Estados aceitos:
+    - queued: aguardando processamento;
+    - processing: em andamento;
+    - processed: concluída;
+    - error: falhou e aguarda nova solicitação.
+
+    Tarefas que ficaram presas em processing por mais de 20 minutos
+    são recuperadas automaticamente.
+    """
+
+    total_processed = 0
+    total_failed = 0
+
+    print("Iniciando processamento da fila de análises personalizadas.")
+
+    while True:
+        now = datetime.now(timezone.utc)
+        stale_before = (
+            now - timedelta(minutes=20)
+        ).isoformat()
+
+        queued_rows = db_get_all("user_edition_analyses", {
+            "select": (
+                "id,user_id,edition_id,status,updated_at"
+            ),
+            "status": "eq.queued",
+            "order": "updated_at.asc",
+        })
+
+        stale_rows = db_get_all("user_edition_analyses", {
+            "select": (
+                "id,user_id,edition_id,status,updated_at"
+            ),
+            "status": "eq.processing",
+            "updated_at": f"lt.{stale_before}",
+            "order": "updated_at.asc",
+        })
+
+        # Evita processar a mesma tarefa duas vezes na mesma rodada.
+        jobs_by_id: dict[str, dict[str, Any]] = {}
+
+        for job in queued_rows + stale_rows:
+            job_id = clean_str(job.get("id"))
+            if job_id:
+                jobs_by_id[job_id] = job
+
+        jobs = sorted(
+            jobs_by_id.values(),
+            key=lambda job: clean_str(job.get("updated_at")),
+        )
+
+        if not jobs:
+            print("Fila de análises vazia. Nenhuma tarefa pendente.")
+            break
+
+        print(
+            f"Fila encontrada: {len(jobs)} tarefa(s) "
+            "pendente(s) ou interrompida(s)."
+        )
+
+        for job in jobs:
+            job_id = clean_str(job.get("id"))
+            user_id = clean_str(job.get("user_id"))
+            edition_id = clean_str(job.get("edition_id"))
+
+            if not job_id or not user_id or not edition_id:
+                print(
+                    f"Tarefa com identificadores inválidos: {job_id!r}.",
+                    file=sys.stderr,
+                )
+                total_failed += 1
+                continue
+
+            try:
+                # Confere a edição antes de iniciar a análise.
+                edition_rows = db_get("editions", {
+                    "select": "id,edition_date,edition_label",
+                    "id": f"eq.{edition_id}",
+                    "limit": "1",
+                })
+
+                if not edition_rows:
+                    message = "A edição associada à tarefa não foi encontrada."
+
+                    db_patch(
+                        "user_edition_analyses",
+                        {"id": f"eq.{job_id}"},
+                        {
+                            "status": "error",
+                            "error": message,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+
+                    print(
+                        f"Falha na tarefa {job_id[:8]}…: {message}",
+                        file=sys.stderr,
+                    )
+
+                    total_failed += 1
+                    continue
+
+                edition = edition_rows[0]
+                edition_date = clean_str(edition.get("edition_date"))
+                edition_label = clean_str(
+                    edition.get("edition_label"),
+                    "Parte II · Poder Legislativo",
+                )
+
+                # Atualiza a tarefa e renova seu marcador de atividade.
+                db_patch(
+                    "user_edition_analyses",
+                    {"id": f"eq.{job_id}"},
+                    {
+                        "status": "processing",
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "finished_at": None,
+                        "error": None,
+                    },
+                )
+
+                print(
+                    f"Processando tarefa: edição {edition_date}; "
+                    f"usuário {user_id[:8]}…"
+                )
+
+                result = analyze_edition_for_users(
+                    edition_id=edition_id,
+                    edition_date=edition_date,
+                    edition_label=edition_label,
+                    only_user_id=user_id,
+                )
+
+                if int(result.get("failed", 0)):
+                    total_failed += 1
+                    print(
+                        f"A análise do usuário {user_id[:8]}… "
+                        "terminou com erro. Os lotes já salvos foram preservados.",
+                        file=sys.stderr,
+                    )
+                else:
+                    total_processed += 1
+                    print(
+                        f"Tarefa concluída: edição {edition_date}; "
+                        f"usuário {user_id[:8]}…"
+                    )
+
+            except Exception as exc:
+                message = clean_str(exc)[:1800]
+
+                print(
+                    f"Falha ao processar tarefa {job_id[:8]}…: {message}",
+                    file=sys.stderr,
+                )
+
+                try:
+                    db_patch(
+                        "user_edition_analyses",
+                        {"id": f"eq.{job_id}"},
+                        {
+                            "status": "error",
+                            "error": message,
+                            "finished_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                except Exception as status_error:
+                    print(
+                        f"Não foi possível atualizar o estado da tarefa: {status_error}",
+                        file=sys.stderr,
+                    )
+
+                total_failed += 1
+
+        # Consulta novamente a fila. Isso permite incluir tarefas que tenham
+        # sido adicionadas enquanto esta execução estava em andamento.
+
+    print(
+        "Processamento da fila encerrado. "
+        f"Concluídas: {total_processed}; falhas: {total_failed}."
+    )
+
 
 def edition_exists(edition_date: str, edition_key: str) -> dict[str, Any] | None:
     found = db_get("editions", {
@@ -1482,8 +2020,17 @@ def process_source(source: dict[str, Any]) -> None:
 
 def process() -> None:
     mode = os.getenv("EDITION_SCAN_MODE", "regular").strip().lower()
+
+    # O modo analysis não consulta a IOERJ.
+    # Apenas consome as tarefas já registradas no Supabase.
+    if mode == "analysis":
+        process_analysis_queue()
+        return
+
     if mode not in {"regular", "extra", "both"}:
-        raise RuntimeError("EDITION_SCAN_MODE deve ser regular, extra ou both.")
+        raise RuntimeError(
+            "EDITION_SCAN_MODE deve ser regular, extra, both ou analysis."
+        )
 
     modes = ["regular", "extra"] if mode == "both" else [mode]
     failures = []
