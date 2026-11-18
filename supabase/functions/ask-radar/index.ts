@@ -102,6 +102,25 @@ PERGUNTA: ${question}
 PUBLICAÇÕES ENCONTRADAS:
 ${JSON.stringify(groundedSources)}`;
 
+const { error: rateLimitError } = await supabase.rpc(
+  "reserve_gemini_slot",
+  {
+    p_interval_seconds: 6.0,
+  },
+);
+
+if (rateLimitError) {
+  console.error(
+    "Não foi possível reservar o intervalo da API Gemini:",
+    rateLimitError,
+  );
+
+  return json({
+    error: "Não foi possível reservar o acesso ao serviço de IA. Tente novamente.",
+  }, 503);
+}
+
+  
   const aiResponse = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(geminiModel)}:generateContent`,
     {
