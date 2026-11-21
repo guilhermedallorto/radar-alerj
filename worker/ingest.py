@@ -24,7 +24,7 @@ except ImportError:
     import fitz  # compatibilidade com versões antigas
 import pytesseract
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from PIL import Image
 from playwright.async_api import async_playwright
 
@@ -99,6 +99,42 @@ def extract_date(soup: BeautifulSoup, selection_url: str) -> date:
     raise RuntimeError("Não foi possível identificar a data da última edição no portal da IOERJ.")
 
 
+def adjacent_link_label(element: Tag) -> str:
+    """Recupera rótulos que o portal coloca imediatamente fora do link.
+
+    A IOERJ, por exemplo, publica a expressão 'EDIÇÃO EXTRA' como texto
+    adjacente ao <a>, e não dentro dele. A leitura é limitada aos nós vizinhos
+    até o próximo link para não misturar o rótulo de cadernos diferentes.
+    """
+    parts: list[str] = []
+
+    for direction in ("previous_siblings", "next_siblings"):
+        for sibling in getattr(element, direction):
+            if isinstance(sibling, Tag):
+                if sibling.name in {"a", "button", "area"} or sibling.find(["a", "button", "area"]):
+                    break
+                text = sibling.get_text(" ", strip=True)
+            else:
+                text = str(sibling).strip()
+
+            if text:
+                parts.append(text)
+                break
+
+    # Alguns layouts envolvem o link e seu rótulo em um contêiner próprio.
+    # Só usamos o texto integral do contêiner quando ele contém um único
+    # elemento clicável, evitando misturar o rótulo de links irmãos.
+    parent = element.parent
+    if isinstance(parent, Tag):
+        clickable = parent.find_all(["a", "button", "area"])
+        if len(clickable) == 1:
+            parent_text = parent.get_text(" ", strip=True)
+            if parent_text:
+                parts.append(parent_text)
+
+    return " ".join(parts)
+
+
 def find_part_ii_links(
     html: str,
     base_url: str,
@@ -115,6 +151,7 @@ def find_part_ii_links(
     for element in soup.find_all(["a", "button", "area"]):
         label_parts = [
             element.get_text(" ", strip=True),
+            adjacent_link_label(element),
             element.get("title", ""),
             element.get("aria-label", ""),
             element.get("data-original-title", ""),
@@ -145,6 +182,11 @@ def find_part_ii_links(
             if not match:
                 continue
             target = urljoin(base_url, match.group(1))
+        detected_type = "extra" if is_extra else "regular"
+        print(
+            f"Link da Parte II identificado: tipo={detected_type}; "
+            f"rótulo={label!r}; destino={target}"
+        )
         if target not in found:
             found.append(target)
 
