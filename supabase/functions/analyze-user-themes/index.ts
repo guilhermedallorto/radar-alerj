@@ -393,8 +393,4 @@ Responda somente JSON no formato {"items":[{"publication_id":"UUID","relevant":t
     }
     return json({ error: message }, 502);
   }
-<<<<<<< HEAD
 });
-=======
-});
->>>>>>> e9ef30a828e48c2cc4e1e61e4b19a53a25b8e35a
