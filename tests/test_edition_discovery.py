@@ -125,7 +125,7 @@ class EditionDiscoveryTests(unittest.TestCase):
 
         def fake_gemini(prompt, max_output_tokens=8000):
             calls.append((len(prompt), max_output_tokens))
-            if len(prompt) > 7000:
+            if len(prompt) > 10000:
                 raise RuntimeError(
                     "O Gemini não devolveu JSON válido "
                     "(finishReason=MAX_TOKENS; tokens_de_saida=24000): {"
