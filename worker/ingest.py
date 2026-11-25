@@ -326,14 +326,18 @@ def discover_editions(
 
     scan_date = target_date or datetime.now(ZoneInfo(TZ)).date()
 
-    if edition_type == "extra":
+    if edition_type == "extra" or target_date is not None:
         calendar_result = discover_calendar_selection(scan_date)
         if calendar_result is None:
-            print(
-                f"O calendário da IOERJ ainda não lista {scan_date.isoformat()}; "
-                "nenhuma edição extra a conferir nessa data."
+            if edition_type == "extra":
+                print(
+                    f"O calendário da IOERJ ainda não lista {scan_date.isoformat()}; "
+                    "nenhuma edição extra a conferir nessa data."
+                )
+                return []
+            raise RuntimeError(
+                f"O calendário da IOERJ não contém uma edição regular para {scan_date.isoformat()}."
             )
-            return []
     else:
         calendar_result = discover_latest_from_calendar()
 
@@ -2242,6 +2246,21 @@ def process() -> None:
 
     modes = ["regular", "extra"] if mode == "both" else [mode]
     failures = []
+    requested_date_raw = os.getenv("EDITION_TARGET_DATE", "").strip()
+    requested_date = None
+    if requested_date_raw:
+        try:
+            requested_date = date.fromisoformat(requested_date_raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                "EDITION_TARGET_DATE deve estar no formato YYYY-MM-DD."
+            ) from exc
+        if requested_date.isoformat() != requested_date_raw:
+            raise RuntimeError("EDITION_TARGET_DATE deve estar no formato YYYY-MM-DD.")
+        if mode != "regular":
+            raise RuntimeError(
+                "EDITION_TARGET_DATE só pode ser utilizado com EDITION_SCAN_MODE=regular."
+            )
 
     for edition_type in modes:
         check_started_at = datetime.now(timezone.utc)
@@ -2254,6 +2273,7 @@ def process() -> None:
         scan_dates = (
             [today_local - timedelta(days=1), today_local]
             if edition_type == "extra"
+            else [requested_date] if requested_date is not None
             else [None]
         )
 
