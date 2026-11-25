@@ -985,13 +985,49 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
         return parsed
 
     except Exception as exc:
+        candidate = candidates[0] if candidates else {}
+        finish_reason = candidate.get("finishReason") or "não informado"
+        usage = data.get("usageMetadata") or {}
+        output_tokens = usage.get("candidatesTokenCount", "não informado")
         raise RuntimeError(
-            f"O Gemini não devolveu JSON válido: {output[:800]}"
+            "O Gemini não devolveu JSON válido "
+            f"(finishReason={finish_reason}; tokens_de_saida={output_tokens}): "
+            f"{output[:500]}"
         ) from exc
 
 
-def classify_chunk(chunk: dict[str, Any], edition_date: str) -> list[dict[str, Any]]:
-    """Segmenta o conteúdo do caderno em publicações, sem classificar temas globais."""
+def split_text_for_retry(text: str) -> tuple[str, str] | None:
+    """Divide um trecho em um limite legível, preservando todos os caracteres."""
+    if len(text) < 5000:
+        return None
+
+    midpoint = len(text) // 2
+    lower = int(len(text) * 0.38)
+    upper = int(len(text) * 0.62)
+
+    for pattern in (r"\n\s*\n", r"\n", r"[ \t]+"):
+        matches = [
+            match for match in re.finditer(pattern, text)
+            if lower <= match.end() <= upper
+        ]
+        if matches:
+            boundary = min(matches, key=lambda match: abs(match.end() - midpoint)).end()
+            return text[:boundary], text[boundary:]
+
+    # Último recurso: divide em um espaço próximo ao meio, sem cortar palavras.
+    boundary = text.rfind(" ", max(1, midpoint - 1000), min(len(text), midpoint + 1000))
+    if boundary > 0:
+        return text[:boundary + 1], text[boundary + 1:]
+
+    return None
+
+
+def classify_chunk(
+    chunk: dict[str, Any],
+    edition_date: str,
+    _retry_depth: int = 0,
+) -> list[dict[str, Any]]:
+    """Segmenta o lote e recupera automaticamente respostas JSON truncadas."""
     prompt = f"""Você é um analista documental responsável por segmentar uma edição do Diário Oficial do Estado do Rio de Janeiro, Parte II — Poder Legislativo.
 
 TAREFA: identificar e separar TODAS as publicações oficiais individuais presentes no trecho. Esta etapa é compartilhada entre usuários: NÃO avalie relevância temática, não selecione assuntos e não gere destaques para um gabinete específico.
@@ -1003,16 +1039,40 @@ REGRAS:
 - Agrupe itens somente quando a própria publicação indicar uma relação/listagem conjunta.
 - O texto em `text` deve ser fiel ao documento, sem paráfrase, e suficiente para consulta posterior.
 - Quando não souber, use null ou array vazio.
-- `page_start` e `page_end` são números das páginas físicas do PDF.
+- `page_start` e `page_end` são números das páginas físicas do PDF. Use os marcadores [PÁGINA N] quando existirem; na ausência de marcador no fragmento, considere o intervalo indicado abaixo.
 - Os campos `relevant`, `matched_themes`, `confidence`, `justification` e `summary` devem ser, respectivamente, false, [], null, null e null. A análise temática será feita separadamente para cada usuário autenticado.
 
 DATA DA EDIÇÃO: {edition_date}
+INTERVALO FÍSICO DO LOTE: páginas {chunk.get('start_page')} a {chunk.get('end_page')}
 
 RETORNE SOMENTE JSON no formato {{"items":[{{"page_start":1,"page_end":1,"type":"...","title":"...","text":"...","organization":"...","people":[],"municipalities":[],"amounts":[],"relevant":false,"matched_themes":[],"confidence":null,"justification":null,"summary":null}}]}}
 
 TEXTO:
 {chunk['text']}"""
-    result = gemini_json(prompt, 9000)
+    try:
+        result = gemini_json(prompt, 24000)
+    except RuntimeError as exc:
+        split = split_text_for_retry(str(chunk.get("text") or ""))
+        recoverable_json_error = "não devolveu json válido" in str(exc).lower()
+        if recoverable_json_error and split and _retry_depth < 4:
+            print(
+                "Resposta JSON incompleta do Gemini; "
+                f"dividindo o lote (nível {_retry_depth + 1}/4; "
+                f"{len(chunk.get('text') or ''):,} caracteres) e reprocessando."
+            )
+            recovered: list[dict[str, Any]] = []
+            for part_number, part_text in enumerate(split, start=1):
+                subchunk = {**chunk, "text": part_text}
+                print(
+                    f"Reprocessando fragmento {part_number}/2 "
+                    f"({len(part_text):,} caracteres; páginas "
+                    f"{chunk.get('start_page')}–{chunk.get('end_page')})."
+                )
+                recovered.extend(
+                    classify_chunk(subchunk, edition_date, _retry_depth + 1)
+                )
+            return recovered
+        raise
     if isinstance(result, list):
         items = result
         print("Aviso: Gemini retornou uma lista na raiz; formato normalizado para items.")
