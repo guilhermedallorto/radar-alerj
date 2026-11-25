@@ -14,6 +14,10 @@ on:
           - extra
           - both
         default: both
+      edition_date:
+        description: 'Data específica da edição regular (YYYY-MM-DD; opcional)'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -35,9 +39,11 @@ jobs:
         env:
           RADAR_EVENT_NAME: ${{ github.event_name }}
           RADAR_SCAN_MODE: ${{ inputs.scan_mode || 'both' }}
+          RADAR_EDITION_DATE: ${{ inputs.edition_date || 'mais recente' }}
         run: |
           echo "Evento: ${RADAR_EVENT_NAME}"
           echo "Modo solicitado: ${RADAR_SCAN_MODE}"
+          echo "Data específica: ${RADAR_EDITION_DATE}"
           echo "Horário UTC: $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
           echo "Horário de Brasília: $(TZ=America/Sao_Paulo date '+%Y-%m-%d %H:%M:%S %Z')"
           echo "GitHub Run ID: ${{ github.run_id }}"
@@ -68,4 +74,5 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           EDITION_SCAN_MODE: ${{ inputs.scan_mode || 'both' }}
+          EDITION_TARGET_DATE: ${{ inputs.edition_date || '' }}
         run: python worker/ingest.py
