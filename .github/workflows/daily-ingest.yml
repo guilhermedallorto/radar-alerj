@@ -72,7 +72,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           EDITION_SCAN_MODE: ${{ inputs.scan_mode || 'both' }}
           EDITION_TARGET_DATE: ${{ inputs.edition_date || '' }}
         run: python worker/ingest.py
