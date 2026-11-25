@@ -8,7 +8,7 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SECRET_KEY", "test-only-placeholder")
 os.environ.setdefault("GEMINI_API_KEY", "test-only-placeholder")
 
-from worker.ingest import analyze_edition_for_users, classify_chunk, discover_editions, find_part_ii_link, find_part_ii_links, publication_key, split_text_for_retry, user_theme_signature
+from worker.ingest import GEMINI_MODELS, analyze_edition_for_users, classify_chunk, discover_editions, find_part_ii_link, find_part_ii_links, gemini_json, publication_key, split_text_for_retry, user_theme_signature
 
 
 class EditionDiscoveryTests(unittest.TestCase):
@@ -172,6 +172,62 @@ class EditionDiscoveryTests(unittest.TestCase):
         self.assertEqual({item["page_start"] for item in result}, {3})
         self.assertEqual({item["page_end"] for item in result}, {3})
         self.assertTrue(all(item["relevant"] is False for item in result))
+
+
+    def test_gemini_falls_back_only_to_the_configured_secondary_model(self):
+        self.assertEqual(
+            GEMINI_MODELS,
+            ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"),
+        )
+
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, status_code, payload=None, text=""):
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 300
+                self.payload = payload or {}
+                self.text = text
+                self.headers = {}
+
+            def json(self):
+                return self.payload
+
+        def fake_post(url, **kwargs):
+            calls.append(url)
+            if "gemini-3.5-flash-lite" in url:
+                return FakeResponse(
+                    503,
+                    text='{"error":{"message":"temporary overload"}}',
+                )
+            return FakeResponse(
+                200,
+                payload={
+                    "candidates": [{
+                        "content": {"parts": [{"text": '{"items":[]}'}]},
+                        "finishReason": "STOP",
+                    }],
+                    "usageMetadata": {"candidatesTokenCount": 12},
+                },
+            )
+
+        with patch("worker.ingest.reserve_gemini_slot", return_value=None), \
+             patch("worker.ingest.requests.post", side_effect=fake_post), \
+             patch("worker.ingest.time.sleep", return_value=None):
+            result = gemini_json("prompt de teste")
+
+        self.assertEqual(result, {"items": []})
+        self.assertEqual(
+            calls,
+            ["https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"] * 3
+            + ["https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"],
+        )
+        self.assertTrue(
+            all(
+                ("gemini-3.5-flash-lite" in url) or ("gemini-3.1-flash-lite" in url)
+                for url in calls
+            )
+        )
 
 
 if __name__ == "__main__":
