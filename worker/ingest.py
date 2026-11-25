@@ -32,7 +32,7 @@ PORTAL = "https://portal.ioerj.com.br/"
 LAST_EDITION = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_ultima_edicao.php"  # fallback
 SELECT_DATE = "https://www.ioerj.com.br/portal/modules/conteudoonline/do_seleciona_data.php"
 TZ = "America/Sao_Paulo"
-MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+GEMINI_MODELS = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite")
 
 # Intervalo mínimo global entre chamadas ao Gemini.
 # Corresponde a, no máximo, 12 requisições por minuto.
@@ -845,9 +845,7 @@ def reserve_gemini_slot(
 
 
 def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | list[Any]:
-    """Solicita JSON ao Gemini, respeitando o limitador global e tratando 429/503."""
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-
+    """Solicita JSON usando 3.5 Flash-Lite e, em caso de falha, 3.1 Flash-Lite."""
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -856,148 +854,152 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
         },
     }
 
-    response = None
-    max_attempts = 6
+    failures: list[str] = []
+    retryable_statuses = {500, 502, 503, 504}
+    max_attempts = 3
+    code_fence = chr(96) * 3
 
-    for attempt in range(1, max_attempts + 1):
-        # Todas as execuções que utilizam este banco compartilham o mesmo controle.
-        reserve_gemini_slot(
-            interval_seconds=GEMINI_INTERVAL_SECONDS
+    for model in GEMINI_MODELS:
+        endpoint = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
         )
+        model_error = None
 
-        try:
-            response = requests.post(
-                endpoint,
-                headers={
-                    "x-goog-api-key": GEMINI_KEY,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=(25, 120),
-            )
+        for attempt in range(1, max_attempts + 1):
+            reserve_gemini_slot(interval_seconds=GEMINI_INTERVAL_SECONDS)
 
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ) as exc:
-            if attempt >= max_attempts:
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers={
+                        "x-goog-api-key": GEMINI_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=(25, 120),
+                )
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                if attempt < max_attempts:
+                    wait_seconds = min(30, 5 * (2 ** (attempt - 1)))
+                    print(
+                        f"Gemini sem resposta no modelo {model} "
+                        f"({type(exc).__name__}); tentativa {attempt}/{max_attempts}. "
+                        f"Nova tentativa em {wait_seconds}s."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                model_error = (
+                    f"falha de rede/timeout após {max_attempts} tentativas: {exc}"
+                )
+                break
+
+            if not response.ok:
+                detail = response.text[:1500]
+                if response.status_code == 429:
+                    model_error = f"HTTP 429 (limite de uso): {detail}"
+                    break
+
+                if response.status_code in retryable_statuses:
+                    if attempt < max_attempts:
+                        retry_after = (getattr(response, "headers", {}) or {}).get(
+                            "Retry-After", ""
+                        )
+                        try:
+                            wait_seconds = float(retry_after)
+                        except (TypeError, ValueError):
+                            wait_seconds = min(30, 5 * (2 ** (attempt - 1)))
+
+                        wait_seconds = max(3, min(wait_seconds, 60))
+                        print(
+                            f"Gemini temporariamente indisponível no modelo {model} "
+                            f"(HTTP {response.status_code}); tentativa "
+                            f"{attempt}/{max_attempts}, nova tentativa em "
+                            f"{wait_seconds:.0f}s."
+                        )
+                        time.sleep(wait_seconds)
+                        continue
+
+                    model_error = (
+                        f"HTTP {response.status_code} após {max_attempts} tentativas: "
+                        f"{detail}"
+                    )
+                    break
+
                 raise RuntimeError(
-                    f"Gemini não respondeu após {max_attempts} tentativas; "
-                    f"última falha de rede/timeout: {exc}"
-                ) from exc
+                    f"Gemini API retornou HTTP {response.status_code} "
+                    f"no modelo {model}: {detail}"
+                )
 
-            wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
+            try:
+                data = response.json()
+                candidates = data.get("candidates") or []
+                candidate = candidates[0] if candidates else {}
+                parts = candidate.get("content", {}).get("parts", [])
 
+                output = "\n".join(
+                    part.get("text", "")
+                    for part in parts
+                    if isinstance(part, dict)
+                    and isinstance(part.get("text"), str)
+                    and not part.get("thought")
+                ).strip()
+
+                if not output:
+                    feedback = data.get("promptFeedback", {}).get("blockReason")
+                    finish_reason = candidate.get("finishReason")
+                    raise ValueError(
+                        "resposta sem texto utilizável "
+                        f"(bloqueio={feedback or 'não informado'}; "
+                        f"conclusão={finish_reason or 'sem candidato'})"
+                    )
+
+                candidate_json = output
+                if candidate_json.startswith(code_fence):
+                    fence_pattern = (
+                        "^" + re.escape(code_fence) + r"(?:json)?\s*|\s*"
+                        + re.escape(code_fence) + "$"
+                    )
+                    candidate_json = re.sub(
+                        fence_pattern, "", candidate_json, flags=re.I
+                    ).strip()
+
+                parsed = json.loads(candidate_json)
+                if not isinstance(parsed, (dict, list)):
+                    raise ValueError(
+                        "A resposta JSON deve ser um objeto ou uma lista."
+                    )
+
+                print(f"Gemini respondeu com o modelo {model}.")
+                return parsed
+
+            except Exception as exc:
+                candidate = candidates[0] if "candidates" in locals() and candidates else {}
+                finish_reason = candidate.get("finishReason") or "não informado"
+                usage = data.get("usageMetadata") if "data" in locals() and isinstance(data, dict) else {}
+                output_tokens = (usage or {}).get("candidatesTokenCount", "não informado")
+                model_error = (
+                    f"resposta inválida ({type(exc).__name__}; "
+                    f"finishReason={finish_reason}; tokens_de_saida={output_tokens}): "
+                    f"{str(exc)[:500]}"
+                )
+                break
+
+        failures.append(f"{model}: {model_error or 'falha não especificada'}")
+        if model != GEMINI_MODELS[-1]:
             print(
-                f"Gemini sem resposta ({type(exc).__name__}); "
-                f"tentativa {attempt}/{max_attempts}. "
-                f"Nova tentativa em {wait_seconds}s."
+                f"O modelo {model} falhou. Acionando somente o próximo modelo "
+                "autorizado na configuração."
             )
 
-            time.sleep(wait_seconds)
-            continue
-
-        if response.ok:
-            break
-
-        if response.status_code not in (429, 500, 502, 503, 504) or attempt >= max_attempts:
-            raise RuntimeError(
-                f"Gemini API retornou HTTP {response.status_code} "
-                f"após {attempt} tentativa(s): {response.text[:1500]}"
-            )
-
-        # Respeita primeiro o Retry-After do HTTP.
-        retry_after = response.headers.get("Retry-After", "")
-
-        try:
-            wait_seconds = float(retry_after)
-        except (TypeError, ValueError):
-            wait_seconds = None
-
-        # Algumas respostas do Google trazem o tempo apenas no corpo JSON:
-        # "Please retry in 33.0073285s."
-        if wait_seconds is None:
-            retry_match = re.search(
-                r"retry in\s+([\d.]+)\s*s",
-                response.text,
-                re.I,
-            )
-
-            if retry_match:
-                try:
-                    wait_seconds = float(retry_match.group(1))
-                except ValueError:
-                    wait_seconds = None
-
-        # Backoff exponencial se o Google não informar o tempo.
-        if wait_seconds is None:
-            wait_seconds = min(90, 5 * (2 ** (attempt - 1)))
-
-        wait_seconds = max(3, min(wait_seconds, 180))
-
-        print(
-            f"Gemini temporariamente indisponível (HTTP {response.status_code}); "
-            f"tentativa {attempt}/{max_attempts}, "
-            f"nova tentativa em {wait_seconds:.0f}s."
-        )
-
-        time.sleep(wait_seconds)
-
-    else:
-        raise RuntimeError(
-            "Gemini não respondeu após todas as tentativas configuradas."
-        )
-
-    data = response.json()
-    candidates = data.get("candidates") or []
-    parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-
-    output = "\n".join(
-        part.get("text", "")
-        for part in parts
-        if isinstance(part, dict)
-        and isinstance(part.get("text"), str)
-        and not part.get("thought")
-    ).strip()
-
-    if not output:
-        feedback = data.get("promptFeedback", {}).get("blockReason")
-        finish_reason = candidates[0].get("finishReason") if candidates else None
-
-        raise RuntimeError(
-            "Gemini não devolveu texto utilizável. "
-            f"Motivo de bloqueio: {feedback or 'não informado'}; "
-            f"conclusão: {finish_reason or 'sem candidato'}."
-        )
-
-    candidate_json = output.strip()
-
-    if candidate_json.startswith("```"):
-        candidate_json = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            candidate_json,
-            flags=re.I,
-        ).strip()
-
-    try:
-        parsed = json.loads(candidate_json)
-
-        if not isinstance(parsed, (dict, list)):
-            raise ValueError("A resposta JSON deve ser um objeto ou uma lista.")
-
-        return parsed
-
-    except Exception as exc:
-        candidate = candidates[0] if candidates else {}
-        finish_reason = candidate.get("finishReason") or "não informado"
-        usage = data.get("usageMetadata") or {}
-        output_tokens = usage.get("candidatesTokenCount", "não informado")
-        raise RuntimeError(
-            "O Gemini não devolveu JSON válido "
-            f"(finishReason={finish_reason}; tokens_de_saida={output_tokens}): "
-            f"{output[:500]}"
-        ) from exc
+    raise RuntimeError(
+        "Nenhum dos modelos Gemini configurados conseguiu processar a solicitação. "
+        + " | ".join(failures)
+    )
 
 
 def split_text_for_retry(text: str) -> tuple[str, str] | None:
