@@ -1,12 +1,14 @@
 import os
 import unittest
+from datetime import date
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SECRET_KEY", "test-only-placeholder")
 os.environ.setdefault("GEMINI_API_KEY", "test-only-placeholder")
 
-from worker.ingest import analyze_edition_for_users, classify_chunk, find_part_ii_link, find_part_ii_links, publication_key, split_text_for_retry, user_theme_signature
+from worker.ingest import analyze_edition_for_users, classify_chunk, discover_editions, find_part_ii_link, find_part_ii_links, publication_key, split_text_for_retry, user_theme_signature
 
 
 class EditionDiscoveryTests(unittest.TestCase):
@@ -46,6 +48,24 @@ class EditionDiscoveryTests(unittest.TestCase):
         )
         result = find_part_ii_link(html_without_extra, self.base_url, "extra", required=False)
         self.assertIsNone(result)
+
+    def test_regular_target_date_uses_exact_calendar_date(self):
+        target = date(2026, 11, 24)
+        page = SimpleNamespace(
+            text="<html><body><h1>Diário Oficial</h1></body></html>",
+            url="https://www.ioerj.com.br/portal/modules/conteudoonline/do_seleciona_edicao.php?data=MjAyNjExMjQ=",
+        )
+
+        with patch("worker.ingest.discover_calendar_selection", return_value=(target, "selection-url")) as calendar, \
+             patch("worker.ingest.http_get", return_value=page), \
+             patch("worker.ingest.extract_date", return_value=target), \
+             patch("worker.ingest.find_part_ii_links", return_value=["https://ioerj.test/legislativo.pdf"]):
+            editions = discover_editions("regular", target_date=target)
+
+        calendar.assert_called_once_with(target)
+        self.assertEqual(len(editions), 1)
+        self.assertEqual(editions[0]["edition_date"], "2026-11-24")
+        self.assertEqual(editions[0]["edition_type"], "regular")
 
     def test_user_theme_signature_is_independent_of_input_order(self):
         themes = [
