@@ -6,7 +6,7 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SECRET_KEY", "test-only-placeholder")
 os.environ.setdefault("GEMINI_API_KEY", "test-only-placeholder")
 
-from worker.ingest import analyze_edition_for_users, find_part_ii_link, find_part_ii_links, publication_key, user_theme_signature
+from worker.ingest import analyze_edition_for_users, classify_chunk, find_part_ii_link, find_part_ii_links, publication_key, split_text_for_retry, user_theme_signature
 
 
 class EditionDiscoveryTests(unittest.TestCase):
@@ -109,6 +109,49 @@ class EditionDiscoveryTests(unittest.TestCase):
         second_extra = publication_key("2026-10-29", item, "extra", "extra-b")
         self.assertNotEqual(regular, extra)
         self.assertNotEqual(extra, second_extra)
+
+
+    def test_split_text_for_retry_preserves_all_characters(self):
+        original = ("Primeiro parágrafo com conteúdo.\\n\\nSegundo parágrafo com conteúdo.\\n" * 150)
+        parts = split_text_for_retry(original)
+        self.assertIsNotNone(parts)
+        self.assertEqual(parts[0] + parts[1], original)
+        self.assertTrue(parts[0])
+        self.assertTrue(parts[1])
+
+    def test_classification_recovers_when_gemini_truncates_json(self):
+        source = ("Parágrafo de conteúdo oficial com dados e dispositivos legais.\\n\\n" * 150)
+        calls = []
+
+        def fake_gemini(prompt, max_output_tokens=8000):
+            calls.append((len(prompt), max_output_tokens))
+            if len(prompt) > 7000:
+                raise RuntimeError(
+                    "O Gemini não devolveu JSON válido "
+                    "(finishReason=MAX_TOKENS; tokens_de_saida=24000): {"
+                )
+            return {
+                "items": [{
+                    "page_start": None,
+                    "page_end": None,
+                    "type": "Ato",
+                    "title": "Trecho",
+                    "text": "Texto preservado",
+                }]
+            }
+
+        with patch("worker.ingest.gemini_json", side_effect=fake_gemini):
+            result = classify_chunk(
+                {"start_page": 3, "end_page": 3, "text": source},
+                "2026-11-25",
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(tokens == 24000 for _, tokens in calls))
+        self.assertEqual(len(result), 2)
+        self.assertEqual({item["page_start"] for item in result}, {3})
+        self.assertEqual({item["page_end"] for item in result}, {3})
+        self.assertTrue(all(item["relevant"] is False for item in result))
 
 
 if __name__ == "__main__":
