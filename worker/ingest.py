@@ -935,6 +935,8 @@ def gemini_json(prompt: str, max_output_tokens: int = 8000) -> dict[str, Any] | 
                     f"no modelo {model}: {detail}"
                 )
 
+            data: dict[str, Any] = {}
+            candidates: list[dict[str, Any]] = []
             try:
                 data = response.json()
                 candidates = data.get("candidates") or []
